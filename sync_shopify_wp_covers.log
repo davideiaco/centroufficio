@@ -1,0 +1,6 @@
+2026-03-25 17:24:30,762 | INFO | === AVVIO SINCRONIZZAZIONE COPERTINE SHOPIFY <- WORDPRESS ===
+2026-03-25 17:24:30,764 | INFO | Store Shopify: didalibri.myshopify.com
+2026-03-25 17:24:30,766 | INFO | API version Shopify: 2026-01
+2026-03-25 17:24:30,767 | INFO | WordPress media search URL: https://didalibri.com/wp-json/wp/v2/media
+2026-03-25 17:24:30,769 | INFO | DRY_RUN: False
+2026-03-25 17:24:30,771 | INFO | default.jpg caricato da: C:\Users\davide\Desktop\connettore\default.jpg

@@ -1,0 +1,747 @@
+2026-02-18 16:07:43,492 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-02-18 16:07:45,813 | INFO | Record letti con EAN: 18601
+2026-02-18 16:07:46,900 | INFO | Bulk productSet: 18601 (chunk=5000)
+2026-02-18 16:07:46,901 | INFO | [productSet] Chunk 1/4 | inizio elaborazione
+2026-03-24 13:57:47,567 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-24 13:57:47,602 | INFO | Record letti con EAN: 50
+2026-03-24 13:57:47,632 | INFO | Bulk productSet: 50 (chunk=5000)
+2026-03-24 13:57:47,633 | INFO | [productSet] Chunk 1/1 | inizio elaborazione
+2026-03-24 13:58:25,068 | ERROR | Errore chiamata Shopify GraphQL (ultimo tentativo)
+{
+  "error": "401 Client Error: Unauthorized for url: https://didalibri.myshopify.com/admin/api/2026-01/graphql.json",
+  "status": 401
+}
+2026-03-24 13:58:25,077 | ERROR | ERRORE FATALE durante sync
+{
+  "error": "401 Client Error: Unauthorized for url: https://didalibri.myshopify.com/admin/api/2026-01/graphql.json"
+}
+2026-03-24 14:02:55,402 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-24 14:02:55,422 | INFO | Record letti con EAN: 50
+2026-03-24 14:02:55,441 | INFO | Bulk productSet: 50 (chunk=5000)
+2026-03-24 14:02:55,443 | INFO | [productSet] Chunk 1/1 | inizio elaborazione
+2026-03-24 14:03:33,266 | ERROR | Errore chiamata Shopify GraphQL (ultimo tentativo)
+{
+  "error": "401 Client Error: Unauthorized for url: https://didalibri.myshopify.com/admin/api/2026-01/graphql.json",
+  "status": 401
+}
+2026-03-24 14:03:33,269 | ERROR | ERRORE FATALE durante sync
+{
+  "error": "401 Client Error: Unauthorized for url: https://didalibri.myshopify.com/admin/api/2026-01/graphql.json"
+}
+2026-03-24 16:18:13,498 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-24 16:18:13,531 | INFO | Record letti con EAN: 50
+2026-03-24 16:18:13,555 | INFO | Bulk productSet: 50 (chunk=5000)
+2026-03-24 16:18:13,556 | INFO | [productSet] Chunk 1/1 | inizio elaborazione
+2026-03-24 16:18:14,797 | INFO | Token Shopify non valido/scaduto: rigenerazione access token in corso
+2026-03-24 16:18:16,130 | INFO | Nuovo access token Shopify generato e salvato in config.env
+2026-03-24 16:18:16,144 | INFO | Retry chiamata Shopify GraphQL con nuovo access token
+2026-03-24 16:18:40,698 | INFO | [productSet] Chunk 1/1 | COMPLETED in 27.16s
+2026-03-24 16:18:40,714 | INFO | Bulk publish: 50 (chunk=5000)
+2026-03-24 16:18:40,714 | INFO | [publish] Chunk 1/1 | inizio elaborazione
+2026-03-24 16:18:52,711 | INFO | [publish] Chunk 1/1 | COMPLETED in 12.00s
+2026-03-24 16:18:52,711 | INFO | === SYNC COMPLETATA ===
+2026-03-24 16:18:52,719 | INFO | Creati:     50
+2026-03-24 16:18:52,720 | INFO | Aggiornati: 0
+2026-03-24 16:18:52,721 | INFO | Invariati:  0
+2026-03-24 16:18:52,722 | INFO | Spariti->0: 0
+2026-03-24 16:18:52,723 | INFO | State DB:   C:\Users\davide\Desktop\connettore\shopify_sync_state.sqlite
+2026-03-24 16:18:52,724 | INFO | Log file:   C:\Users\davide\Desktop\connettore\shopify_sync.log
+2026-03-24 16:23:12,735 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-24 16:23:12,865 | INFO | Record letti con EAN: 1000
+2026-03-24 16:23:12,919 | INFO | Bulk productSet: 950 (chunk=5000)
+2026-03-24 16:23:12,919 | INFO | [productSet] Chunk 1/1 | inizio elaborazione
+2026-03-24 16:26:13,567 | INFO | [productSet] Chunk 1/1 | COMPLETED in 180.64s
+2026-03-24 16:26:13,568 | INFO | Bulk publish: 950 (chunk=5000)
+2026-03-24 16:26:13,569 | INFO | [publish] Chunk 1/1 | inizio elaborazione
+2026-03-24 16:27:26,990 | INFO | [publish] Chunk 1/1 | COMPLETED in 73.44s
+2026-03-24 16:27:27,007 | INFO | === SYNC COMPLETATA ===
+2026-03-24 16:27:27,008 | INFO | Creati:     950
+2026-03-24 16:27:27,009 | INFO | Aggiornati: 0
+2026-03-24 16:27:27,010 | INFO | Invariati:  50
+2026-03-24 16:27:27,011 | INFO | Spariti->0: 0
+2026-03-24 16:27:27,012 | INFO | State DB:   C:\Users\davide\Desktop\connettore\shopify_sync_state.sqlite
+2026-03-24 16:27:27,013 | INFO | Log file:   C:\Users\davide\Desktop\connettore\shopify_sync.log
+2026-03-24 16:30:53,470 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-24 16:30:55,684 | INFO | Record letti con EAN: 18601
+2026-03-24 16:30:56,674 | INFO | Bulk productSet: 17601 (chunk=5000)
+2026-03-24 16:30:56,674 | INFO | [productSet] Chunk 1/4 | inizio elaborazione
+2026-03-24 16:45:40,161 | INFO | [productSet] Chunk 1/4 | COMPLETED in 883.49s
+2026-03-24 16:45:40,169 | INFO | [productSet] Chunk 2/4 | inizio elaborazione
+2026-03-24 16:59:47,617 | INFO | [productSet] Chunk 2/4 | COMPLETED in 847.45s
+2026-03-24 16:59:47,619 | INFO | [productSet] Chunk 3/4 | inizio elaborazione
+2026-03-24 17:13:24,666 | INFO | [productSet] Chunk 3/4 | COMPLETED in 817.05s
+2026-03-24 17:13:24,676 | INFO | [productSet] Chunk 4/4 | inizio elaborazione
+2026-03-24 17:20:39,542 | ERROR | productSet userErrors (EAN=i profumi ac0)
+[
+  {
+    "field": [
+      "input",
+      "files",
+      "0",
+      "originalSource"
+    ],
+    "message": "File URL is invalid"
+  }
+]
+2026-03-24 17:20:39,647 | INFO | [productSet] Chunk 4/4 | COMPLETED in 434.97s
+2026-03-24 17:20:39,647 | INFO | Bulk publish: 17600 (chunk=5000)
+2026-03-24 17:20:39,648 | INFO | [publish] Chunk 1/4 | inizio elaborazione
+2026-03-24 17:27:04,454 | INFO | [publish] Chunk 1/4 | COMPLETED in 384.81s
+2026-03-24 17:27:04,455 | INFO | [publish] Chunk 2/4 | inizio elaborazione
+2026-03-24 17:32:26,858 | INFO | [publish] Chunk 2/4 | COMPLETED in 322.40s
+2026-03-24 17:32:26,860 | INFO | [publish] Chunk 3/4 | inizio elaborazione
+2026-03-24 17:37:48,564 | INFO | [publish] Chunk 3/4 | COMPLETED in 321.71s
+2026-03-24 17:37:48,566 | INFO | [publish] Chunk 4/4 | inizio elaborazione
+2026-03-24 17:40:53,589 | INFO | [publish] Chunk 4/4 | COMPLETED in 185.02s
+2026-03-24 17:40:53,591 | INFO | === SYNC COMPLETATA ===
+2026-03-24 17:40:53,592 | INFO | Creati:     17600
+2026-03-24 17:40:53,593 | INFO | Aggiornati: 0
+2026-03-24 17:40:53,594 | INFO | Invariati:  1000
+2026-03-24 17:40:53,594 | INFO | Spariti->0: 0
+2026-03-24 17:40:53,595 | INFO | State DB:   C:\Users\davide\Desktop\connettore\shopify_sync_state.sqlite
+2026-03-24 17:40:53,595 | INFO | Log file:   C:\Users\davide\Desktop\connettore\shopify_sync.log
+2026-03-25 17:26:58,089 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-25 17:26:58,128 | INFO | Record letti con EAN: 10
+2026-03-25 17:26:58,250 | INFO | Bulk productSet: 0 (chunk=5000)
+2026-03-25 17:26:59,568 | INFO | Token Shopify non valido/scaduto: rigenerazione access token in corso
+2026-03-25 17:27:00,984 | INFO | Nuovo access token Shopify generato e salvato in config.env
+2026-03-25 17:27:00,988 | INFO | Retry chiamata Shopify GraphQL con nuovo access token
+2026-03-25 17:27:02,212 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:27:05,478 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:27:10,706 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:27:20,038 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:27:37,377 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:27:37,384 | ERROR | Errore chiamata Shopify GraphQL (ultimo tentativo)
+{
+  "error": "Autenticazione Shopify fallita anche dopo refresh token",
+  "status": null
+}
+2026-03-25 17:27:37,386 | ERROR | ERRORE FATALE durante sync
+{
+  "error": "Autenticazione Shopify fallita anche dopo refresh token"
+}
+2026-03-25 17:29:23,211 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-25 17:29:23,228 | INFO | Record letti con EAN: 10
+2026-03-25 17:29:23,301 | INFO | Bulk productSet: 0 (chunk=5000)
+2026-03-25 17:29:24,586 | INFO | Token Shopify non valido/scaduto: rigenerazione access token in corso
+2026-03-25 17:29:25,969 | INFO | Nuovo access token Shopify generato e salvato in config.env
+2026-03-25 17:29:25,972 | INFO | Retry GraphQL dopo refresh token per errore auth applicativo
+2026-03-25 17:29:27,214 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:29:30,471 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:29:35,736 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:29:44,960 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:30:02,353 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:30:02,362 | ERROR | Errore chiamata Shopify GraphQL (ultimo tentativo)
+{
+  "error": "Autenticazione Shopify fallita anche dopo refresh token",
+  "status": null
+}
+2026-03-25 17:30:02,365 | ERROR | ERRORE FATALE durante sync
+{
+  "error": "Autenticazione Shopify fallita anche dopo refresh token"
+}
+2026-03-25 17:30:34,945 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-25 17:30:34,962 | INFO | Record letti con EAN: 10
+2026-03-25 17:30:35,047 | INFO | Bulk productSet: 0 (chunk=5000)
+2026-03-25 17:30:36,312 | INFO | Token Shopify non valido/scaduto: rigenerazione access token in corso
+2026-03-25 17:30:37,673 | INFO | Nuovo access token Shopify generato e salvato in config.env
+2026-03-25 17:30:37,677 | INFO | Retry GraphQL dopo refresh token per errore auth applicativo
+2026-03-25 17:30:38,922 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:30:42,139 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:30:47,363 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:30:56,582 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:31:13,845 | ERROR | Errore autenticazione Shopify anche dopo refresh token
+{
+  "errors": [
+    {
+      "message": "Access denied for inventorySetQuantities field. Required access: `write_inventory` access scope. Also: The user must have a permission to update an inventory.",
+      "locations": [
+        {
+          "line": 2,
+          "column": 3
+        }
+      ],
+      "extensions": {
+        "code": "ACCESS_DENIED",
+        "documentation": "https://shopify.dev/api/usage/access-scopes",
+        "requiredAccess": "`write_inventory` access scope. Also: The user must have a permission to update an inventory."
+      },
+      "path": [
+        "inventorySetQuantities"
+      ]
+    }
+  ],
+  "data": {
+    "inventorySetQuantities": null
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 10,
+      "actualQueryCost": 10,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
+2026-03-25 17:31:13,850 | ERROR | Errore chiamata Shopify GraphQL (ultimo tentativo)
+{
+  "error": "Autenticazione Shopify fallita anche dopo refresh token",
+  "status": null
+}
+2026-03-25 17:31:13,852 | ERROR | ERRORE FATALE durante sync
+{
+  "error": "Autenticazione Shopify fallita anche dopo refresh token"
+}
+2026-03-25 17:35:46,198 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-25 17:35:46,215 | INFO | Record letti con EAN: 10
+2026-03-25 17:35:46,295 | INFO | Bulk productSet: 0 (chunk=5000)
+2026-03-25 17:35:47,558 | INFO | Token Shopify non valido/scaduto: rigenerazione access token in corso
+2026-03-25 17:35:48,916 | INFO | Nuovo access token Shopify generato e salvato in config.env
+2026-03-25 17:35:48,922 | INFO | Retry chiamata Shopify GraphQL con nuovo access token
+2026-03-25 17:37:57,443 | INFO | === SYNC COMPLETATA ===
+2026-03-25 17:37:57,446 | INFO | Creati:     0
+2026-03-25 17:37:57,447 | INFO | Aggiornati: 0
+2026-03-25 17:37:57,449 | INFO | Invariati:  10
+2026-03-25 17:37:57,452 | INFO | Spariti->0: 18590
+2026-03-25 17:37:57,453 | INFO | State DB:   C:\Users\davide\Desktop\connettore\shopify_sync_state.sqlite
+2026-03-25 17:37:57,458 | INFO | Log file:   C:\Users\davide\Desktop\connettore\shopify_sync.log
+2026-03-25 17:38:14,982 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-03-25 17:38:15,000 | INFO | Record letti con EAN: 10
+2026-03-25 17:38:15,093 | INFO | Bulk productSet: 0 (chunk=5000)
+2026-04-03 15:19:15,499 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-04-03 15:19:17,570 | INFO | Record letti con EAN: 18601
+2026-04-03 15:20:11,499 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-04-03 15:20:13,561 | INFO | Record letti con EAN: 18601
+2026-04-03 15:20:14,262 | INFO | Bulk productSet: 1 (chunk=5000)
+2026-04-03 15:20:14,262 | INFO | [productSet] Chunk 1/1 | inizio elaborazione
+2026-04-03 15:20:16,467 | INFO | Token Shopify non valido/scaduto: rigenerazione access token in corso
+2026-04-03 15:20:17,702 | INFO | Nuovo access token Shopify generato e salvato in config.env
+2026-04-03 15:20:17,717 | INFO | Retry chiamata Shopify GraphQL con nuovo access token
+2026-04-03 15:20:31,324 | ERROR | productSet userErrors (EAN=i profumi ac0)
+[
+  {
+    "field": [
+      "input",
+      "files",
+      "0",
+      "originalSource"
+    ],
+    "message": "File URL is invalid"
+  }
+]
+2026-04-03 15:20:31,328 | INFO | [productSet] Chunk 1/1 | COMPLETED in 17.06s
+2026-04-03 15:20:31,335 | INFO | === SYNC COMPLETATA ===
+2026-04-03 15:20:31,336 | INFO | Creati:     0
+2026-04-03 15:20:31,337 | INFO | Aggiornati: 0
+2026-04-03 15:20:31,337 | INFO | Invariati:  18600
+2026-04-03 15:20:31,338 | INFO | Spariti->0: 0
+2026-04-03 15:20:31,339 | INFO | State DB:   C:\Users\davide\Desktop\connettore_last\shopify_sync_state.sqlite
+2026-04-03 15:20:31,339 | INFO | Log file:   C:\Users\davide\Desktop\connettore_last\shopify_sync.log
+2026-04-03 15:34:04,549 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-04-03 15:34:06,763 | ERROR | Record scartato: CODICE_EAN contiene spazi
+{
+  "raw_ean": "i profumi ac0",
+  "titolo": "LEGAMI CANDELA PROFUMATA  SCENTED CANDLE"
+}
+2026-04-03 15:34:06,819 | INFO | Record letti con EAN: 18600
+2026-04-03 15:34:07,621 | INFO | Bulk productSet: 0 (chunk=5000)
+2026-04-03 15:34:07,627 | INFO | === SYNC COMPLETATA ===
+2026-04-03 15:34:07,628 | INFO | Creati:     0
+2026-04-03 15:34:07,628 | INFO | Aggiornati: 0
+2026-04-03 15:34:07,629 | INFO | Invariati:  18600
+2026-04-03 15:34:07,630 | INFO | Spariti->0: 0
+2026-04-03 15:34:07,630 | INFO | State DB:   C:\Users\davide\Desktop\connettore_last\shopify_sync_state.sqlite
+2026-04-03 15:34:07,631 | INFO | Log file:   C:\Users\davide\Desktop\connettore_last\shopify_sync.log
