@@ -1,10 +1,6 @@
 from dotenv import load_dotenv
 from pathlib import Path
-
-# carica config.env dalla stessa cartella del file .py
-env_path = Path(__file__).parent / "config.env"
-load_dotenv(dotenv_path=env_path)
-
+import sys
 import os
 import re
 import html
@@ -19,41 +15,75 @@ import logging
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 
+
 # =============================================================================
-# LOGGING (solo ERROR + COMPLETAMENTO)
+# PATHS APP: compatibili sia con .py che con .exe
 # =============================================================================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_PATH = os.path.join(SCRIPT_DIR, "shopify_sync.log")
+def get_app_dir() -> Path:
+    """
+    Restituisce la cartella applicazione:
+    - se script Python: cartella del file .py
+    - se eseguibile PyInstaller: cartella del file .exe
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = get_app_dir()
+ENV_PATH = APP_DIR / "config.env"
+
+# carica config.env dalla stessa cartella del .py / .exe
+load_dotenv(dotenv_path=ENV_PATH)
+
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+SCRIPT_DIR = str(APP_DIR)
+LOG_PATH = str(APP_DIR / "shopify_sync.log")
 
 logger = logging.getLogger("shopify_sync")
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
 _fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-_file = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-_file.setLevel(logging.INFO)
-_file.setFormatter(_fmt)
-
-_console = logging.StreamHandler()
-_console.setLevel(logging.INFO)
-_console.setFormatter(_fmt)
-
 if not logger.handlers:
+    _file = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=5_000_000,
+        backupCount=3,
+        encoding="utf-8"
+    )
+    _file.setLevel(logging.INFO)
+    _file.setFormatter(_fmt)
+
+    _console = logging.StreamHandler()
+    _console.setLevel(logging.INFO)
+    _console.setFormatter(_fmt)
+
     logger.addHandler(_file)
     logger.addHandler(_console)
 
-def log_error(msg: str, details: Any = None, *, max_chars: int = 2500):
+
+def log_error(msg: str, details: Any = None, *, max_chars: int = 2500) -> None:
     if details is None:
         logger.error(msg)
         return
+
     try:
-        s = json.dumps(details, ensure_ascii=False, indent=2)
+        s = json.dumps(details, ensure_ascii=False, indent=2, default=str)
     except Exception:
         s = str(details)
+
     if len(s) > max_chars:
         s = s[:max_chars] + f"\n…(troncato, {len(s)} chars totali)"
+
     logger.error(f"{msg}\n{s}")
+
 
 # =============================================================================
 # CONFIG (da ENV)
@@ -62,8 +92,10 @@ def log_error(msg: str, details: Any = None, *, max_chars: int = 2500):
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
+
 def _env_bool(name: str, default: str = "0") -> bool:
     return _env(name, default) == "1"
+
 
 def _env_int(name: str, default: str = "0") -> int:
     try:
@@ -71,9 +103,11 @@ def _env_int(name: str, default: str = "0") -> int:
     except ValueError:
         return int(default)
 
+
 def _env_csv(name: str, default: str = "") -> List[str]:
     raw = _env(name, default)
     return [x.strip() for x in raw.split(",") if x.strip()]
+
 
 DATA_DIR = _env("DATA_DIR", r"C:\WinVaria\data")
 
@@ -95,11 +129,13 @@ DEFAULT_TAGS = _env_csv("DEFAULT_TAGS", "libro")
 PUBLICATION_IDS = _env_csv("SHOPIFY_PUBLICATION_IDS", "")
 
 LIMIT_RECORDS = _env_int("LIMIT_RECORDS", "0")
-COVER_URL_TEMPLATE = _env("COVER_URL_TEMPLATE", "https://www.ibs.it/images/{isbn}_0_0_0_0_0.jpg")
-#LEGAMI: https://www.lafeltrinelli.it/images/8052694116347_0_0_0_0_0.jpg
+COVER_URL_TEMPLATE = _env(
+    "COVER_URL_TEMPLATE",
+    "https://www.ibs.it/images/{isbn}_0_0_0_0_0.jpg"
+)
 
-# Stato SQLite: nella cartella dello script
-STATE_DB_PATH = os.path.join(SCRIPT_DIR, "shopify_sync_state.sqlite")
+# Stato SQLite: nella cartella dello script / exe
+STATE_DB_PATH = str(APP_DIR / "shopify_sync_state.sqlite")
 
 # Bulk tuning
 BULK_ENABLED = _env_bool("BULK_ENABLED", "1")
@@ -107,20 +143,29 @@ BULK_CHUNK_SIZE = _env_int("BULK_CHUNK_SIZE", "5000")
 SQLITE_UPSERT_BATCH = _env_int("SQLITE_UPSERT_BATCH", "2000")
 INVENTORY_ZERO_BATCH = _env_int("INVENTORY_ZERO_BATCH", "200")
 
+
 # =============================================================================
 # SHOPIFY TOKEN REFRESH
 # =============================================================================
 
-TOKEN_ENV_PATH = env_path
+TOKEN_ENV_PATH = ENV_PATH
 
 SHOPIFY_REFRESH_CLIENT_ID = _env("SHOPIFY_REFRESH_CLIENT_ID", "")
 SHOPIFY_REFRESH_CLIENT_SECRET = _env("SHOPIFY_REFRESH_CLIENT_SECRET", "")
+
 
 def _shop_name_only(shop_value: str) -> str:
     shop_value = (shop_value or "").strip()
     if not shop_value:
         return ""
-    return shop_value.replace("https://", "").replace("http://", "").replace(".myshopify.com", "").strip("/")
+    return (
+        shop_value
+        .replace("https://", "")
+        .replace("http://", "")
+        .replace(".myshopify.com", "")
+        .strip("/")
+    )
+
 
 def update_config_env_access_token(new_token: str, file_path: Path = TOKEN_ENV_PATH) -> None:
     if not new_token:
@@ -142,6 +187,7 @@ def update_config_env_access_token(new_token: str, file_path: Path = TOKEN_ENV_P
         new_content = content + replacement + "\n"
 
     file_path.write_text(new_content, encoding="utf-8")
+
 
 def refresh_shopify_access_token() -> str:
     global SHOPIFY_ACCESS_TOKEN
@@ -173,8 +219,9 @@ def refresh_shopify_access_token() -> str:
     SHOPIFY_ACCESS_TOKEN = new_token
     os.environ["SHOPIFY_ACCESS_TOKEN"] = new_token
 
-    logger.info("Nuovo access token Shopify generato e salvato in config.env")
+    logger.info(f"Nuovo access token Shopify generato e salvato in: {file_path_str(TOKEN_ENV_PATH)}")
     return new_token
+
 
 def _graphql_has_auth_error(data: Dict[str, Any]) -> bool:
     if not isinstance(data, dict):
@@ -196,10 +243,12 @@ def _graphql_has_auth_error(data: Dict[str, Any]) -> bool:
 
     return False
 
+
 def _is_auth_http_error(resp: Optional[requests.Response]) -> bool:
     if resp is None:
         return False
     return resp.status_code in (401, 403)
+
 
 # =============================================================================
 # DBF / FPT minimal reader (Visual FoxPro DBF + FPT memo)
@@ -207,9 +256,11 @@ def _is_auth_http_error(resp: Optional[requests.Response]) -> bool:
 
 FieldDef = Tuple[str, str, int, int]  # (name, type, length, decimals)
 
+
 def _read_all_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
+
 
 def parse_dbf_fields(dbf: bytes) -> Tuple[List[FieldDef], int, int, int]:
     num_records = struct.unpack("<I", dbf[4:8])[0]
@@ -221,7 +272,7 @@ def parse_dbf_fields(dbf: bytes) -> Tuple[List[FieldDef], int, int, int]:
     while off < header_len:
         if dbf[off] == 0x0D:
             break
-        name = dbf[off:off+11].split(b"\x00", 1)[0].decode("ascii", errors="ignore")
+        name = dbf[off:off + 11].split(b"\x00", 1)[0].decode("ascii", errors="ignore")
         ftype = chr(dbf[off + 11])
         length = dbf[off + 16]
         dec = dbf[off + 17]
@@ -229,6 +280,7 @@ def parse_dbf_fields(dbf: bytes) -> Tuple[List[FieldDef], int, int, int]:
         off += 32
 
     return fields, header_len, record_len, num_records
+
 
 def build_field_offsets(fields: List[FieldDef]) -> List[Tuple[str, str, int, int, int]]:
     offsets = []
@@ -238,27 +290,32 @@ def build_field_offsets(fields: List[FieldDef]) -> List[Tuple[str, str, int, int
         off += length
     return offsets
 
+
 def read_fpt_memo(fpt: bytes, block_index: int) -> Optional[str]:
     if not block_index:
         return None
+
     block_size = struct.unpack(">H", fpt[6:8])[0]
     start = block_index * block_size
     if start + 8 > len(fpt):
         return None
 
-    _mtype = struct.unpack(">I", fpt[start:start+4])[0]
-    mlen = struct.unpack(">I", fpt[start+4:start+8])[0]
-    payload = fpt[start+8:start+8+mlen]
+    _mtype = struct.unpack(">I", fpt[start:start + 4])[0]
+    mlen = struct.unpack(">I", fpt[start + 4:start + 8])[0]
+    payload = fpt[start + 8:start + 8 + mlen]
 
     return payload.decode("cp1252", errors="ignore").rstrip("\x00").strip()
 
-def parse_record(dbf: bytes,
-                 field_offsets: List[Tuple[str, str, int, int, int]],
-                 header_len: int,
-                 record_len: int,
-                 rec_index: int) -> Optional[Dict[str, Any]]:
+
+def parse_record(
+    dbf: bytes,
+    field_offsets: List[Tuple[str, str, int, int, int]],
+    header_len: int,
+    record_len: int,
+    rec_index: int,
+) -> Optional[Dict[str, Any]]:
     base = header_len + rec_index * record_len
-    rec = dbf[base:base+record_len]
+    rec = dbf[base:base + record_len]
     if not rec:
         return None
     if rec[0] == 0x2A:  # deleted
@@ -266,7 +323,7 @@ def parse_record(dbf: bytes,
 
     out: Dict[str, Any] = {}
     for name, ftype, length, dec, off in field_offsets:
-        raw = rec[off:off+length]
+        raw = rec[off:off + length]
 
         if ftype == "C":
             out[name] = raw.decode("cp1252", errors="ignore").rstrip()
@@ -285,11 +342,12 @@ def parse_record(dbf: bytes,
             c = raw[:1].decode("ascii", errors="ignore").upper()
             out[name] = c in ("Y", "T")
         elif ftype == "M":
-            out[name] = struct.unpack("<I", raw)[0]  # FPT pointer
+            out[name] = struct.unpack("<I", raw)[0]
         else:
             out[name] = raw
 
     return out
+
 
 # =============================================================================
 # Helpers: case-insensitive field access + tipologie map
@@ -307,6 +365,7 @@ def get_ci(row: Dict[str, Any], *keys: str, default=None):
             return row.get(lower_map[lk], default)
     return default
 
+
 def load_tipologie_map(dbf_path: str) -> Dict[int, str]:
     if not os.path.exists(dbf_path):
         raise FileNotFoundError(f"DBF tipologie non trovato: {dbf_path}")
@@ -322,30 +381,54 @@ def load_tipologie_map(dbf_path: str) -> Dict[int, str]:
             continue
 
         raw_id = get_ci(r, "ID", "Id", "ID_TIPO", "Id_tipo", "IDTIPO", default=None)
-        desc = (get_ci(r, "DESCRIZIONE", "Descrizione", "DESC", "Description", "DESCRIZION", default="") or "").strip()
+        desc = (
+            get_ci(
+                r,
+                "DESCRIZIONE",
+                "Descrizione",
+                "DESC",
+                "Description",
+                "DESCRIZION",
+                default=""
+            ) or ""
+        ).strip()
+
         if raw_id is None:
             continue
+
         try:
             id_int = int(raw_id)
         except (TypeError, ValueError):
             continue
+
         if desc:
             m[id_int] = desc
 
     return m
 
+
 # =============================================================================
 # Shopify GraphQL (retry) + error logs + auto refresh token
 # =============================================================================
 
-def shopify_graphql(endpoint: str, token: str, query: str, variables: Dict[str, Any], *, max_retries: int = 6) -> Dict[str, Any]:
+def shopify_graphql(
+    endpoint: str,
+    token: str,
+    query: str,
+    variables: Dict[str, Any],
+    *,
+    max_retries: int = 6
+) -> Dict[str, Any]:
     global SHOPIFY_ACCESS_TOKEN
 
     current_token = token
     auth_refresh_done = False
 
     for attempt in range(max_retries):
-        headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": current_token}
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": current_token
+        }
 
         try:
             resp = requests.post(
@@ -396,10 +479,12 @@ def shopify_graphql(endpoint: str, token: str, query: str, variables: Dict[str, 
                     }
                 )
                 raise
+
             sleep_s = min(2 ** attempt, 30)
             time.sleep(sleep_s)
 
     raise RuntimeError("Unreachable")
+
 
 # =============================================================================
 # Shopify standard mutation (inventory batch)
@@ -413,6 +498,7 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
 }
 """.strip()
 
+
 def inventory_set_available_zero_batch(endpoint: str, inventory_item_ids: List[str]) -> Dict[str, Any]:
     variables = {
         "input": {
@@ -420,16 +506,30 @@ def inventory_set_available_zero_batch(endpoint: str, inventory_item_ids: List[s
             "reason": "correction",
             "referenceDocumentUri": "gid://erp-connector/SyncJob/missing-record",
             "quantities": [
-                {"inventoryItemId": inv_id, "locationId": SHOPIFY_LOCATION_ID, "quantity": 0, "changeFromQuantity": None}
+                {
+                    "inventoryItemId": inv_id,
+                    "locationId": SHOPIFY_LOCATION_ID,
+                    "quantity": 0,
+                    "changeFromQuantity": None
+                }
                 for inv_id in inventory_item_ids
             ],
         }
     }
-    res = shopify_graphql(endpoint, SHOPIFY_ACCESS_TOKEN, MUTATION_INVENTORY_SET_QUANTITIES, variables)
+
+    res = shopify_graphql(
+        endpoint,
+        SHOPIFY_ACCESS_TOKEN,
+        MUTATION_INVENTORY_SET_QUANTITIES,
+        variables
+    )
+
     errs = ((res.get("data") or {}).get("inventorySetQuantities") or {}).get("userErrors") or []
     if errs:
         log_error("inventorySetQuantities userErrors (batch)", errs)
+
     return res
+
 
 # =============================================================================
 # Bulk Operations
@@ -473,15 +573,22 @@ query BulkOp($id: ID!) {
 }
 """.strip()
 
+
 def staged_upload_jsonl(endpoint: str, token: str, *, filename: str, jsonl_bytes: bytes) -> str:
-    res = shopify_graphql(endpoint, token, MUTATION_STAGED_UPLOADS_CREATE, {
-        "input": [{
-            "resource": "BULK_MUTATION_VARIABLES",
-            "filename": filename,
-            "mimeType": "text/jsonl",
-            "httpMethod": "POST",
-        }]
-    })
+    res = shopify_graphql(
+        endpoint,
+        token,
+        MUTATION_STAGED_UPLOADS_CREATE,
+        {
+            "input": [{
+                "resource": "BULK_MUTATION_VARIABLES",
+                "filename": filename,
+                "mimeType": "text/jsonl",
+                "httpMethod": "POST",
+            }]
+        }
+    )
+
     payload = (res.get("data") or {}).get("stagedUploadsCreate") or {}
 
     errs = payload.get("userErrors") or []
@@ -504,15 +611,34 @@ def staged_upload_jsonl(endpoint: str, token: str, *, filename: str, jsonl_bytes
         log_error("stagedUploadsCreate: url/key mancanti", t0)
         raise RuntimeError("stagedUploadsCreate url/key mancanti")
 
-    up = requests.post(upload_url, data=list(params.items()), files=[("file", (filename, jsonl_bytes, "text/jsonl"))], timeout=240)
+    up = requests.post(
+        upload_url,
+        data=list(params.items()),
+        files=[("file", (filename, jsonl_bytes, "text/jsonl"))],
+        timeout=240
+    )
+
     if up.status_code not in (200, 201, 204):
         log_error("Upload JSONL fallito", {"status": up.status_code, "text": up.text[:1500]})
         raise RuntimeError("Upload JSONL fallito")
 
     return staged_path
 
-def bulk_run_mutation(endpoint: str, token: str, *, mutation_str: str, staged_upload_path: str, client_identifier: str) -> str:
-    variables = {"mutation": mutation_str, "stagedUploadPath": staged_upload_path, "clientIdentifier": client_identifier}
+
+def bulk_run_mutation(
+    endpoint: str,
+    token: str,
+    *,
+    mutation_str: str,
+    staged_upload_path: str,
+    client_identifier: str
+) -> str:
+    variables = {
+        "mutation": mutation_str,
+        "stagedUploadPath": staged_upload_path,
+        "clientIdentifier": client_identifier
+    }
+
     res = shopify_graphql(endpoint, token, MUTATION_BULK_RUN_MUTATION, variables)
     payload = (res.get("data") or {}).get("bulkOperationRunMutation") or {}
 
@@ -528,14 +654,18 @@ def bulk_run_mutation(endpoint: str, token: str, *, mutation_str: str, staged_up
 
     return op_id
 
+
 def poll_bulk_operation(endpoint: str, token: str, op_id: str, *, poll_seconds: int = 5) -> Dict[str, Any]:
     while True:
         res = shopify_graphql(endpoint, token, QUERY_BULK_OPERATION, {"id": op_id})
         op = (res.get("data") or {}).get("bulkOperation") or {}
         status = (op.get("status") or "").upper()
+
         if status in ("COMPLETED", "FAILED", "CANCELED", "CANCELLED"):
             return op
+
         time.sleep(poll_seconds)
+
 
 def iter_jsonl_from_url(url: str) -> Iterable[Dict[str, Any]]:
     with requests.get(url, stream=True, timeout=600) as r:
@@ -545,12 +675,14 @@ def iter_jsonl_from_url(url: str) -> Iterable[Dict[str, Any]]:
                 continue
             yield json.loads(line)
 
+
 # =============================================================================
 # Mapping WinVaria -> Shopify + hash
 # =============================================================================
 
 EXTERNAL_ID_NAMESPACE = "custom"
 EXTERNAL_ID_KEY = "external_id"
+
 
 def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]:
     titolo = (row.get("TITOLO") or "").strip()
@@ -573,12 +705,33 @@ def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]
     cover_alt = f"Copertina del libro {titolo}".strip()
 
     tags = list(dict.fromkeys([categoria] if categoria else []))
+    if DEFAULT_TAGS:
+        tags = list(dict.fromkeys(tags + DEFAULT_TAGS))
 
     metafields = [
-        {"namespace": "custom", "key": "autore", "type": "single_line_text_field", "value": autore or "Autore sconosciuto"},
-        {"namespace": "custom", "key": "isbn", "type": "single_line_text_field", "value": isbn or ""},
-        {"namespace": "custom", "key": "categoria", "type": "single_line_text_field", "value": categoria or "Categoria sconosciuta"},
-        {"namespace": EXTERNAL_ID_NAMESPACE, "key": EXTERNAL_ID_KEY, "value": ean or ""},
+        {
+            "namespace": "custom",
+            "key": "autore",
+            "type": "single_line_text_field",
+            "value": autore or "Autore sconosciuto"
+        },
+        {
+            "namespace": "custom",
+            "key": "isbn",
+            "type": "single_line_text_field",
+            "value": isbn or ""
+        },
+        {
+            "namespace": "custom",
+            "key": "categoria",
+            "type": "single_line_text_field",
+            "value": categoria or "Categoria sconosciuta"
+        },
+        {
+            "namespace": EXTERNAL_ID_NAMESPACE,
+            "key": EXTERNAL_ID_KEY,
+            "value": ean or ""
+        },
     ]
 
     input_obj: Dict[str, Any] = {
@@ -589,7 +742,11 @@ def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]
         "tags": tags,
         "category": "gid://shopify/TaxonomyCategory/me-1-3",
         "status": "ACTIVE",
-        "productOptions": [{"name": "Title", "position": 1, "values": [{"name": "Default Title"}]}],
+        "productOptions": [{
+            "name": "Title",
+            "position": 1,
+            "values": [{"name": "Default Title"}]
+        }],
         "variants": [{
             "sku": sku,
             "price": f"{float(prezzo):.2f}",
@@ -604,9 +761,14 @@ def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]
     }
 
     if cover_url:
-        input_obj["files"] = [{"originalSource": cover_url, "filename": cover_filename, "alt": cover_alt}]
+        input_obj["files"] = [{
+            "originalSource": cover_url,
+            "filename": cover_filename,
+            "alt": cover_alt
+        }]
 
     return input_obj
+
 
 def compute_row_hash(row: Dict[str, Any]) -> str:
     payload = {
@@ -622,22 +784,28 @@ def compute_row_hash(row: Dict[str, Any]) -> str:
     s = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+
 def pick_ids_from_product_node(product: Dict[str, Any], sku: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     if not product:
         return None, None, None
+
     product_id = product.get("id")
     variants = (((product.get("variants") or {}).get("nodes")) or [])
     chosen = None
     sku = (sku or "").strip()
+
     for v in variants:
         if (v or {}).get("sku") == sku:
             chosen = v
             break
+
     if not chosen and variants:
         chosen = variants[0]
+
     variant_id = (chosen or {}).get("id")
     inventory_item_id = ((chosen or {}).get("inventoryItem") or {}).get("id")
     return product_id, variant_id, inventory_item_id
+
 
 # =============================================================================
 # SQLite state (batch upsert)
@@ -646,6 +814,7 @@ def pick_ids_from_product_node(product: Dict[str, Any], sku: str) -> Tuple[Optio
 class SyncState:
     def __init__(self, path: str):
         self.path = path
+
         db_dir = os.path.dirname(os.path.abspath(path))
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
@@ -655,7 +824,7 @@ class SyncState:
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_schema()
 
-    def _init_schema(self):
+    def _init_schema(self) -> None:
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS items (
             ean TEXT PRIMARY KEY,
@@ -683,13 +852,15 @@ class SyncState:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def finish_run(self, run_id: int):
+    def finish_run(self, run_id: int) -> None:
         now = datetime.datetime.now(datetime.UTC).isoformat()
         self.conn.execute("UPDATE runs SET finished_at=? WHERE run_id=?", (now, run_id))
         self.conn.commit()
 
     def load_all(self) -> Dict[str, Dict[str, Any]]:
-        cur = self.conn.execute("SELECT ean, row_hash, product_id, variant_id, inventory_item_id, last_seen_run FROM items")
+        cur = self.conn.execute(
+            "SELECT ean, row_hash, product_id, variant_id, inventory_item_id, last_seen_run FROM items"
+        )
         out: Dict[str, Dict[str, Any]] = {}
         for ean, row_hash, product_id, variant_id, inventory_item_id, last_seen_run in cur.fetchall():
             out[ean] = {
@@ -701,12 +872,18 @@ class SyncState:
             }
         return out
 
-    def upsert_items_many(self, rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]]):
+    def upsert_items_many(
+        self,
+        rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]]
+    ) -> None:
         if not rows:
             return
+
         now = datetime.datetime.now(datetime.UTC).isoformat()
-        payload = [(ean, row_hash, product_id, variant_id, inventory_item_id, run_id, now)
-                   for (run_id, ean, row_hash, product_id, variant_id, inventory_item_id) in rows]
+        payload = [
+            (ean, row_hash, product_id, variant_id, inventory_item_id, run_id, now)
+            for (run_id, ean, row_hash, product_id, variant_id, inventory_item_id) in rows
+        ]
 
         self.conn.executemany("""
         INSERT INTO items(ean, row_hash, product_id, variant_id, inventory_item_id, last_seen_run, last_synced_at)
@@ -720,6 +897,7 @@ class SyncState:
             last_synced_at=excluded.last_synced_at
         """, payload)
         self.conn.commit()
+
 
 # =============================================================================
 # Lettura testi + categoria
@@ -749,19 +927,17 @@ def read_testi_records() -> List[Dict[str, Any]]:
 
         raw_ean = row.get("CODICE_EAN") or ""
 
-        # se contiene spazi → invalido
         if " " in raw_ean:
             log_error("Record scartato: CODICE_EAN contiene spazi", {
                 "raw_ean": raw_ean,
                 "titolo": row.get("TITOLO"),
             })
             continue
-        
+
         ean = raw_ean.strip()
-        
         if not ean:
             continue
-        
+
         row["CODICE_EAN"] = ean
 
         note_ptr = int(row.get("NOTE") or 0)
@@ -782,6 +958,7 @@ def read_testi_records() -> List[Dict[str, Any]]:
             break
 
     return selected
+
 
 # =============================================================================
 # Bulk mutation strings
@@ -809,20 +986,34 @@ mutation PublishBulk($id: ID!, $input: [PublicationInput!]!) {
 }
 """.strip()
 
+
 def chunked(items: List[Any], size: int) -> Iterable[List[Any]]:
     for i in range(0, len(items), size):
-        yield items[i:i+size]
+        yield items[i:i + size]
 
-def chunk_log(kind: str, idx: int, total: int, msg: str):
+
+def chunk_log(kind: str, idx: int, total: int, msg: str) -> None:
     logger.info(f"[{kind}] Chunk {idx}/{total} | {msg}")
+
+
+def file_path_str(p: Path) -> str:
+    return str(p.resolve())
+
+
+def is_running_as_exe() -> bool:
+    return bool(getattr(sys, "frozen", False))
 
 
 # =============================================================================
 # Main sync
 # =============================================================================
 
-def main():
+def main() -> None:
     logger.info("=== AVVIO SYNC SHOPIFY ===")
+    logger.info(f"APP_DIR:    {SCRIPT_DIR}")
+    logger.info(f"Config env: {file_path_str(ENV_PATH)}")
+    logger.info(f"Log file:   {LOG_PATH}")
+    logger.info(f"State DB:   {STATE_DB_PATH}")
 
     records = read_testi_records()
     logger.info(f"Record letti con EAN: {len(records)}")
@@ -836,15 +1027,20 @@ def main():
         logger.info("DRY_RUN=1 (nessuna chiamata a Shopify)")
     else:
         if not SHOPIFY_SHOP or not SHOPIFY_ACCESS_TOKEN:
-            raise RuntimeError("Config mancante: SHOPIFY_SHOP e SHOPIFY_ACCESS_TOKEN (oppure DRY_RUN=1).")
+            raise RuntimeError(
+                "Config mancante: SHOPIFY_SHOP e SHOPIFY_ACCESS_TOKEN (oppure DRY_RUN=1)."
+            )
         if not SHOPIFY_LOCATION_ID:
             raise RuntimeError("Config mancante: SHOPIFY_LOCATION_ID.")
+
         endpoint = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 
     seen_now: set[str] = set()
-    created = updated = unchanged = zeroed = 0
+    created = 0
+    updated = 0
+    unchanged = 0
+    zeroed = 0
 
-    # preparo liste
     to_upsert: List[Dict[str, Any]] = []
     unchanged_rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]] = []
 
@@ -852,6 +1048,7 @@ def main():
         ean = (row.get("CODICE_EAN") or "").strip()
         if not ean:
             continue
+
         seen_now.add(ean)
 
         h = compute_row_hash(row)
@@ -862,7 +1059,14 @@ def main():
 
         if (not is_new) and (not is_changed):
             unchanged += 1
-            unchanged_rows.append((run_id, ean, h, prev_item.get("product_id"), prev_item.get("variant_id"), prev_item.get("inventory_item_id")))
+            unchanged_rows.append((
+                run_id,
+                ean,
+                h,
+                prev_item.get("product_id"),
+                prev_item.get("variant_id"),
+                prev_item.get("inventory_item_id")
+            ))
         else:
             to_upsert.append({
                 "ean": ean,
@@ -872,12 +1076,10 @@ def main():
             })
 
     try:
-        # aggiorno invariati in batch
         for chunk in chunked(unchanged_rows, SQLITE_UPSERT_BATCH):
             state.upsert_items_many(chunk)
 
         if DRY_RUN:
-            # in dry-run aggiorno solo stato (senza IDs)
             sim = [(run_id, it["ean"], it["row_hash"], None, None, None) for it in to_upsert]
             for chunk in chunked(sim, SQLITE_UPSERT_BATCH):
                 state.upsert_items_many(chunk)
@@ -885,17 +1087,14 @@ def main():
             if not BULK_ENABLED:
                 raise RuntimeError("BULK_ENABLED=0 ma bulk richiesto: imposta BULK_ENABLED=1")
 
-            # ---- BULK productSet ----
             publish_queue: List[str] = []
             logger.info(f"Bulk productSet: {len(to_upsert)} (chunk={BULK_CHUNK_SIZE})")
-            total_chunks = (len(to_upsert) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE
+            total_chunks = (len(to_upsert) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE if to_upsert else 0
 
             for chunk_idx, chunk_items in enumerate(chunked(to_upsert, BULK_CHUNK_SIZE), start=1):
-
                 t_chunk0 = time.perf_counter()
                 chunk_log("productSet", chunk_idx, total_chunks, "inizio elaborazione")
 
-                # build JSONL
                 eans_in_order: List[str] = []
                 rowhash_by_ean: Dict[str, str] = {}
                 isnew_by_ean: Dict[str, bool] = {}
@@ -906,8 +1105,15 @@ def main():
                     eans_in_order.append(ean)
                     rowhash_by_ean[ean] = it["row_hash"]
                     isnew_by_ean[ean] = bool(it["is_new"])
+
                     lines.append(json.dumps({
-                        "identifier": {"customId": {"namespace": EXTERNAL_ID_NAMESPACE, "key": EXTERNAL_ID_KEY, "value": ean}},
+                        "identifier": {
+                            "customId": {
+                                "namespace": EXTERNAL_ID_NAMESPACE,
+                                "key": EXTERNAL_ID_KEY,
+                                "value": ean
+                            }
+                        },
                         "input": it["input"]
                     }, ensure_ascii=False, separators=(",", ":")))
 
@@ -939,16 +1145,16 @@ def main():
                     log_error("Bulk productSet COMPLETED ma url output mancante", op)
                     raise RuntimeError("Output url mancante")
 
-                # parse output e salva solo se OK + product_id presente
                 upsert_rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]] = []
 
                 for i, out_line in enumerate(iter_jsonl_from_url(out_url)):
                     if i >= len(eans_in_order):
                         break
-                    ean = eans_in_order[i]
 
+                    ean = eans_in_order[i]
                     payload = (out_line.get("data") or {}).get("productSet") or {}
                     uerrs = payload.get("userErrors") or []
+
                     if uerrs:
                         log_error(f"productSet userErrors (EAN={ean})", uerrs)
                         continue
@@ -963,7 +1169,6 @@ def main():
                         log_error(f"productSet product_id NULL (EAN={ean})", out_line)
                         continue
 
-                    # estrai variant/inventory se presenti
                     variant_id = None
                     inventory_item_id = None
                     variants = (((product.get("variants") or {}).get("nodes")) or [])
@@ -972,7 +1177,14 @@ def main():
                         variant_id = v0.get("id")
                         inventory_item_id = ((v0.get("inventoryItem") or {}).get("id"))
 
-                    upsert_rows.append((run_id, ean, rowhash_by_ean[ean], product_id, variant_id, inventory_item_id))
+                    upsert_rows.append((
+                        run_id,
+                        ean,
+                        rowhash_by_ean[ean],
+                        product_id,
+                        variant_id,
+                        inventory_item_id
+                    ))
 
                     if isnew_by_ean.get(ean):
                         created += 1
@@ -984,15 +1196,18 @@ def main():
                 for sub in chunked(upsert_rows, SQLITE_UPSERT_BATCH):
                     state.upsert_items_many(sub)
 
-                chunk_log("productSet", chunk_idx, total_chunks, f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s")
+                chunk_log(
+                    "productSet",
+                    chunk_idx,
+                    total_chunks,
+                    f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s"
+                )
 
-            # ---- BULK publish (solo nuovi) ----
             if PUBLICATION_IDS and publish_queue:
                 publish_total = (len(publish_queue) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE
                 logger.info(f"Bulk publish: {len(publish_queue)} (chunk={BULK_CHUNK_SIZE})")
 
                 for chunk_idx, prod_ids in enumerate(chunked(publish_queue, BULK_CHUNK_SIZE), start=1):
-
                     t_chunk0 = time.perf_counter()
                     chunk_log("publish", chunk_idx, publish_total, "inizio elaborazione")
 
@@ -1002,6 +1217,7 @@ def main():
                             "id": pid,
                             "input": [{"publicationId": pub_id} for pub_id in PUBLICATION_IDS]
                         }, ensure_ascii=False, separators=(",", ":")))
+
                     jsonl_bytes = ("\n".join(lines) + "\n").encode("utf-8")
 
                     staged_path = staged_upload_jsonl(
@@ -1027,15 +1243,18 @@ def main():
 
                     out_url = op.get("url")
                     if out_url:
-                        # loggo solo se ci sono userErrors
                         for out_line in iter_jsonl_from_url(out_url):
                             uerrs = ((out_line.get("data") or {}).get("publishablePublish") or {}).get("userErrors") or []
                             if uerrs:
                                 log_error("publishablePublish userErrors", uerrs)
 
-                    chunk_log("publish", chunk_idx, publish_total, f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s")
+                    chunk_log(
+                        "publish",
+                        chunk_idx,
+                        publish_total,
+                        f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s"
+                    )
 
-        # ---- spariti => giacenza 0 (batch) ----
         missing = [ean for ean in prev.keys() if ean not in seen_now]
         if missing and (not DRY_RUN):
             inv_pairs: List[Tuple[str, str]] = []
@@ -1065,5 +1284,24 @@ def main():
     logger.info(f"State DB:   {STATE_DB_PATH}")
     logger.info(f"Log file:   {LOG_PATH}")
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+
+        print("\n=== ERRORE FATALE ===")
+        traceback.print_exc()
+
+        try:
+            logger.exception("Eccezione non gestita")
+        except Exception:
+            pass
+
+        if is_running_as_exe():
+            try:
+                input("\nPremi Invio per chiudere...")
+            except EOFError:
+                pass
+        raise
