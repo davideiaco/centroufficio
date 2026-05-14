@@ -366,6 +366,10 @@ def get_ci(row: Dict[str, Any], *keys: str, default=None):
     return default
 
 
+def clean_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def load_tipologie_map(dbf_path: str) -> Dict[int, str]:
     if not os.path.exists(dbf_path):
         raise FileNotFoundError(f"DBF tipologie non trovato: {dbf_path}")
@@ -381,17 +385,15 @@ def load_tipologie_map(dbf_path: str) -> Dict[int, str]:
             continue
 
         raw_id = get_ci(r, "ID", "Id", "ID_TIPO", "Id_tipo", "IDTIPO", default=None)
-        desc = (
-            get_ci(
-                r,
-                "DESCRIZIONE",
-                "Descrizione",
-                "DESC",
-                "Description",
-                "DESCRIZION",
-                default=""
-            ) or ""
-        ).strip()
+        desc = clean_str(get_ci(
+            r,
+            "DESCRIZIONE",
+            "Descrizione",
+            "DESC",
+            "Description",
+            "DESCRIZION",
+            default=""
+        ))
 
         if raw_id is None:
             continue
@@ -685,17 +687,25 @@ EXTERNAL_ID_KEY = "external_id"
 
 
 def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    titolo = (row.get("TITOLO") or "").strip()
-    autore = (row.get("AUTORE") or "").strip()
-    editore = (row.get("EDITORE") or "").strip()
-    categoria = (row.get("CATEGORIA") or "").strip()
+    titolo = clean_str(get_ci(row, "TITOLO", default=""))
+    sottotitolo = clean_str(get_ci(row, "Sotto_tit", "SOTTO_TIT", "SOTTOTIT", "SOTTOTITOLO", default=""))
+    autore = clean_str(get_ci(row, "AUTORE", default=""))
+    editore = clean_str(get_ci(row, "EDITORE", default=""))
+    categoria = clean_str(get_ci(row, "CATEGORIA", default=""))
 
-    ean = (row.get("CODICE_EAN") or "").strip()
-    prezzo = row.get("PREZZO_EUR") or 0.0
-    giacenza = row.get("GIACENTI") or 0
+    ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
+    prezzo = get_ci(row, "PREZZO_EUR", default=0.0) or 0.0
+    giacenza = get_ci(row, "GIACENTI", default=0) or 0
 
-    note = (row.get("NOTE_TEXT") or "").strip()
-    description_html = f"<p>{html.escape(note)}</p>" if note else "<p></p>"
+    note = clean_str(get_ci(row, "NOTE_TEXT", default=""))
+
+    description_parts: List[str] = []
+    if sottotitolo:
+        description_parts.append(f"<p><strong>{html.escape(sottotitolo)}</strong></p>")
+    if note:
+        description_parts.append(f"<p>{html.escape(note)}</p>")
+
+    description_html = "\n".join(description_parts) if description_parts else "<p></p>"
 
     sku = ean
     isbn = ean
@@ -708,31 +718,45 @@ def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]
     if DEFAULT_TAGS:
         tags = list(dict.fromkeys(tags + DEFAULT_TAGS))
 
-    metafields = [
-        {
+    # ATTENZIONE:
+    # Shopify rifiuta i metafield con value vuoto.
+    # Per questo i campi opzionali vengono aggiunti solo se valorizzati.
+    metafields: List[Dict[str, Any]] = []
+
+    metafields.append({
+        "namespace": "custom",
+        "key": "autore",
+        "type": "single_line_text_field",
+        "value": autore if autore else "Autore sconosciuto"
+    })
+
+    if sottotitolo:
+        metafields.append({
             "namespace": "custom",
-            "key": "autore",
+            "key": "sottotitolo",
             "type": "single_line_text_field",
-            "value": autore or "Autore sconosciuto"
-        },
-        {
-            "namespace": "custom",
-            "key": "isbn",
-            "type": "single_line_text_field",
-            "value": isbn or ""
-        },
-        {
-            "namespace": "custom",
-            "key": "categoria",
-            "type": "single_line_text_field",
-            "value": categoria or "Categoria sconosciuta"
-        },
-        {
-            "namespace": EXTERNAL_ID_NAMESPACE,
-            "key": EXTERNAL_ID_KEY,
-            "value": ean or ""
-        },
-    ]
+            "value": sottotitolo
+        })
+
+    metafields.append({
+        "namespace": "custom",
+        "key": "isbn",
+        "type": "single_line_text_field",
+        "value": isbn if isbn else "-"
+    })
+
+    metafields.append({
+        "namespace": "custom",
+        "key": "categoria",
+        "type": "single_line_text_field",
+        "value": categoria if categoria else "Categoria sconosciuta"
+    })
+
+    metafields.append({
+        "namespace": EXTERNAL_ID_NAMESPACE,
+        "key": EXTERNAL_ID_KEY,
+        "value": ean
+    })
 
     input_obj: Dict[str, Any] = {
         "title": titolo or f"Libro {ean}",
@@ -772,14 +796,15 @@ def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]
 
 def compute_row_hash(row: Dict[str, Any]) -> str:
     payload = {
-        "ean": (row.get("CODICE_EAN") or "").strip(),
-        "titolo": (row.get("TITOLO") or "").strip(),
-        "autore": (row.get("AUTORE") or "").strip(),
-        "editore": (row.get("EDITORE") or "").strip(),
-        "categoria": (row.get("CATEGORIA") or "").strip(),
-        "prezzo": float(row.get("PREZZO_EUR") or 0.0),
-        "giacenza": int(row.get("GIACENTI") or 0),
-        "note": (row.get("NOTE_TEXT") or "").strip(),
+        "ean": clean_str(get_ci(row, "CODICE_EAN", default="")),
+        "titolo": clean_str(get_ci(row, "TITOLO", default="")),
+        "sottotitolo": clean_str(get_ci(row, "Sotto_tit", "SOTTO_TIT", "SOTTOTIT", "SOTTOTITOLO", default="")),
+        "autore": clean_str(get_ci(row, "AUTORE", default="")),
+        "editore": clean_str(get_ci(row, "EDITORE", default="")),
+        "categoria": clean_str(get_ci(row, "CATEGORIA", default="")),
+        "prezzo": float(get_ci(row, "PREZZO_EUR", default=0.0) or 0.0),
+        "giacenza": int(get_ci(row, "GIACENTI", default=0) or 0),
+        "note": clean_str(get_ci(row, "NOTE_TEXT", default="")),
     }
     s = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -925,12 +950,12 @@ def read_testi_records() -> List[Dict[str, Any]]:
         if not row:
             continue
 
-        raw_ean = row.get("CODICE_EAN") or ""
+        raw_ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
 
         if " " in raw_ean:
             log_error("Record scartato: CODICE_EAN contiene spazi", {
                 "raw_ean": raw_ean,
-                "titolo": row.get("TITOLO"),
+                "titolo": get_ci(row, "TITOLO", default=""),
             })
             continue
 
@@ -940,7 +965,7 @@ def read_testi_records() -> List[Dict[str, Any]]:
 
         row["CODICE_EAN"] = ean
 
-        note_ptr = int(row.get("NOTE") or 0)
+        note_ptr = int(get_ci(row, "NOTE", default=0) or 0)
         row["NOTE_TEXT"] = read_fpt_memo(fpt, note_ptr) or ""
 
         id_tipo_raw = get_ci(row, "Id_tipo", "ID_TIPO", "IDTIPO", default=None)
@@ -1045,7 +1070,7 @@ def main() -> None:
     unchanged_rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]] = []
 
     for row in records:
-        ean = (row.get("CODICE_EAN") or "").strip()
+        ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
         if not ean:
             continue
 
@@ -1171,7 +1196,8 @@ def main() -> None:
 
                     variant_id = None
                     inventory_item_id = None
-                    variants = (((product.get("variants") or {}).get("nodes")) or [])
+                    variants = (((product.get("variants") or {}).get("nodes")) or []
+                    )
                     if variants:
                         v0 = variants[0] or {}
                         variant_id = v0.get("id")
@@ -1305,3 +1331,4 @@ if __name__ == "__main__":
             except EOFError:
                 pass
         raise
+
