@@ -96225,3 +96225,58 @@
 2026-05-14 18:52:33,577 | INFO | Spariti->0: 2
 2026-05-14 18:52:33,577 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
 2026-05-14 18:52:33,578 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log
+2026-05-15 11:07:18,223 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-05-15 11:07:18,226 | INFO | APP_DIR:    C:\Users\davide\Desktop\centroufficio
+2026-05-15 11:07:18,227 | INFO | Config env: C:\Users\davide\Desktop\centroufficio\config.env
+2026-05-15 11:07:18,228 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log
+2026-05-15 11:07:18,229 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
+2026-05-15 11:07:20,870 | ERROR | Record scartato: CODICE_EAN contiene spazi
+{
+  "raw_ean": "i profumi ac0",
+  "titolo": "LEGAMI CANDELA PROFUMATA  SCENTED CANDLE"
+}
+2026-05-15 11:07:21,253 | INFO | Record letti con EAN: 20566
+2026-05-15 11:07:25,468 | INFO | Bulk productSet: 1 (chunk=5000)
+2026-05-15 11:07:25,469 | INFO | [productSet] Chunk 1/1 | inizio elaborazione
+2026-05-15 11:07:55,461 | ERROR | productSet userErrors (EAN=9791259746528)
+[
+  {
+    "field": [
+      "input",
+      "productOptions"
+    ],
+    "message": "At least one value for the option linked to the 'shopify.language-version' metafield is invalid"
+  }
+]
+2026-05-15 11:07:55,470 | INFO | [productSet] Chunk 1/1 | COMPLETED in 30.00s
+2026-05-15 11:07:56,563 | INFO | === SYNC COMPLETATA ===
+2026-05-15 11:07:56,565 | INFO | Creati:     0
+2026-05-15 11:07:56,567 | INFO | Aggiornati: 0
+2026-05-15 11:07:56,568 | INFO | Invariati:  20565
+2026-05-15 11:07:56,568 | INFO | Spariti->0: 2
+2026-05-15 11:07:56,569 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
+2026-05-15 11:07:56,570 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log
+2026-05-15 11:09:23,480 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-05-15 11:09:23,481 | INFO | APP_DIR:    C:\Users\davide\Desktop\centroufficio
+2026-05-15 11:09:23,483 | INFO | Config env: C:\Users\davide\Desktop\centroufficio\config.env
+2026-05-15 11:09:23,484 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log
+2026-05-15 11:09:23,485 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
+2026-05-15 11:09:26,078 | ERROR | Record scartato: CODICE_EAN contiene spazi
+{
+  "raw_ean": "i profumi ac0",
+  "titolo": "LEGAMI CANDELA PROFUMATA  SCENTED CANDLE"
+}
+2026-05-15 11:09:26,445 | INFO | Record letti con EAN: 20566
+2026-05-15 11:09:30,629 | INFO | Bulk productSet: 1 (chunk=5000)
+2026-05-15 11:09:30,630 | INFO | [productSet] Chunk 1/1 | inizio elaborazione
+2026-05-15 11:09:42,508 | INFO | [productSet] Chunk 1/1 | COMPLETED in 11.88s
+2026-05-15 11:09:42,509 | INFO | Bulk publish: 1 (chunk=5000)
+2026-05-15 11:09:42,509 | INFO | [publish] Chunk 1/1 | inizio elaborazione
+2026-05-15 11:09:54,603 | INFO | [publish] Chunk 1/1 | COMPLETED in 12.09s
+2026-05-15 11:09:55,690 | INFO | === SYNC COMPLETATA ===
+2026-05-15 11:09:55,692 | INFO | Creati:     1
+2026-05-15 11:09:55,692 | INFO | Aggiornati: 0
+2026-05-15 11:09:55,693 | INFO | Invariati:  20565
+2026-05-15 11:09:55,693 | INFO | Spariti->0: 2
+2026-05-15 11:09:55,694 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
+2026-05-15 11:09:55,695 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log

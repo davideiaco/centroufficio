@@ -686,7 +686,11 @@ EXTERNAL_ID_NAMESPACE = "custom"
 EXTERNAL_ID_KEY = "external_id"
 
 
-def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def build_productset_input_from_testi_row(
+    row: Dict[str, Any],
+    *,
+    include_files: bool = True
+) -> Dict[str, Any]:
     titolo = clean_str(get_ci(row, "TITOLO", default=""))
     sottotitolo = clean_str(get_ci(row, "Sotto_tit", "SOTTO_TIT", "SOTTOTIT", "SOTTOTITOLO", default=""))
     autore = clean_str(get_ci(row, "AUTORE", default=""))
@@ -784,7 +788,11 @@ def build_productset_input_from_testi_row(row: Dict[str, Any]) -> Dict[str, Any]
         "metafields": metafields,
     }
 
-    if cover_url:
+    # IMPORTANTE:
+    # L'immagine va inviata a Shopify solo in creazione.
+    # In modifica NON bisogna passare il campo "files", così Shopify non tocca
+    # l'immagine già presente sul prodotto.
+    if include_files and cover_url:
         input_obj["files"] = [{
             "originalSource": cover_url,
             "filename": cover_filename,
@@ -1096,7 +1104,13 @@ def main() -> None:
             to_upsert.append({
                 "ean": ean,
                 "row_hash": h,
-                "input": build_productset_input_from_testi_row(row),
+                # L'immagine viene inviata solo in creazione.
+                # In modifica Shopify aggiorna le info del prodotto,
+                # ma non riceve il campo "files" e quindi non tocca l'immagine.
+                "input": build_productset_input_from_testi_row(
+                    row,
+                    include_files=is_new
+                ),
                 "is_new": is_new,
             })
 
@@ -1131,6 +1145,15 @@ def main() -> None:
                     rowhash_by_ean[ean] = it["row_hash"]
                     isnew_by_ean[ean] = bool(it["is_new"])
 
+                    input_obj = dict(it["input"])
+
+                    # Protezione extra:
+                    # se il prodotto non è nuovo, rimuoviamo comunque "files"
+                    # prima di inviare la mutation a Shopify.
+                    # Così un aggiornamento non potrà mai modificare l'immagine.
+                    if not bool(it["is_new"]):
+                        input_obj.pop("files", None)
+
                     lines.append(json.dumps({
                         "identifier": {
                             "customId": {
@@ -1139,7 +1162,7 @@ def main() -> None:
                                 "value": ean
                             }
                         },
-                        "input": it["input"]
+                        "input": input_obj
                     }, ensure_ascii=False, separators=(",", ":")))
 
                 jsonl_bytes = ("\n".join(lines) + "\n").encode("utf-8")
@@ -1196,8 +1219,7 @@ def main() -> None:
 
                     variant_id = None
                     inventory_item_id = None
-                    variants = (((product.get("variants") or {}).get("nodes")) or []
-                    )
+                    variants = (((product.get("variants") or {}).get("nodes")) or [])
                     if variants:
                         v0 = variants[0] or {}
                         variant_id = v0.get("id")
@@ -1331,4 +1353,3 @@ if __name__ == "__main__":
             except EOFError:
                 pass
         raise
-
