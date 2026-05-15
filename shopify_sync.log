@@ -96280,3 +96280,25 @@
 2026-05-15 11:09:55,693 | INFO | Spariti->0: 2
 2026-05-15 11:09:55,694 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
 2026-05-15 11:09:55,695 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log
+2026-05-15 14:38:46,829 | INFO | === AVVIO SYNC SHOPIFY ===
+2026-05-15 14:38:46,830 | INFO | APP_DIR:    C:\Users\davide\Desktop\centroufficio
+2026-05-15 14:38:46,832 | INFO | Config env: C:\Users\davide\Desktop\centroufficio\config.env
+2026-05-15 14:38:46,833 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log
+2026-05-15 14:38:46,833 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
+2026-05-15 14:38:46,834 | INFO | WordPress cover enabled: True
+2026-05-15 14:38:46,834 | INFO | WordPress media URL: https://didalibri.com/wp-json/wp/v2/media
+2026-05-15 14:38:49,479 | ERROR | Record scartato: CODICE_EAN contiene spazi
+{
+  "raw_ean": "i profumi ac0",
+  "titolo": "LEGAMI CANDELA PROFUMATA  SCENTED CANDLE"
+}
+2026-05-15 14:38:49,857 | INFO | Record letti con EAN: 20566
+2026-05-15 14:38:50,312 | INFO | Nessun nuovo prodotto: non indicizzo immagini WordPress
+2026-05-15 14:38:54,392 | INFO | Bulk productSet: 0 (chunk=5000)
+2026-05-15 14:38:55,982 | INFO | === SYNC COMPLETATA ===
+2026-05-15 14:38:55,985 | INFO | Creati:     0
+2026-05-15 14:38:55,987 | INFO | Aggiornati: 0
+2026-05-15 14:38:55,988 | INFO | Invariati:  20566
+2026-05-15 14:38:55,991 | INFO | Spariti->0: 2
+2026-05-15 14:38:55,992 | INFO | State DB:   C:\Users\davide\Desktop\centroufficio\shopify_sync_state.sqlite
+2026-05-15 14:38:55,994 | INFO | Log file:   C:\Users\davide\Desktop\centroufficio\shopify_sync.log

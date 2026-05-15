@@ -14,6 +14,7 @@ import time
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple, Iterable
+from urllib.parse import urlparse, unquote
 
 
 # =============================================================================
@@ -133,6 +134,26 @@ COVER_URL_TEMPLATE = _env(
     "COVER_URL_TEMPLATE",
     "https://www.ibs.it/images/{isbn}_0_0_0_0_0.jpg"
 )
+
+# -----------------------------------------------------------------------------
+# WordPress cover first
+# -----------------------------------------------------------------------------
+# Quando viene creato un prodotto nuovo, l'immagine viene scelta così:
+# 1) immagine WordPress trovata tramite EAN
+# 2) fallback al comportamento precedente: COVER_URL_TEMPLATE
+#
+# Gli aggiornamenti dei prodotti esistenti NON inviano mai files a Shopify.
+# -----------------------------------------------------------------------------
+WORDPRESS_COVER_ENABLED = _env_bool("WORDPRESS_COVER_ENABLED", "1")
+WORDPRESS_MEDIA_SEARCH_URL = _env(
+    "WORDPRESS_MEDIA_SEARCH_URL",
+    "https://didalibri.com/wp-json/wp/v2/media"
+)
+WORDPRESS_PER_PAGE = _env_int("WORDPRESS_PER_PAGE", "100")
+WORDPRESS_REQUEST_TIMEOUT = _env_int("WORDPRESS_REQUEST_TIMEOUT", "60")
+WORDPRESS_SLEEP_BETWEEN_PAGES_MS = _env_int("WORDPRESS_SLEEP_BETWEEN_PAGES_MS", "100")
+WORDPRESS_LIMIT_MEDIA = _env_int("WORDPRESS_LIMIT_MEDIA", "0")
+EAN_FROM_MEDIA_RE = re.compile(r"(\d{8,18})")
 
 # Stato SQLite: nella cartella dello script / exe
 STATE_DB_PATH = str(APP_DIR / "shopify_sync_state.sqlite")
@@ -679,6 +700,222 @@ def iter_jsonl_from_url(url: str) -> Iterable[Dict[str, Any]]:
 
 
 # =============================================================================
+# WordPress cover index
+# =============================================================================
+
+def extract_filename_from_url(url: str) -> str:
+    path = urlparse(url or "").path
+    return unquote(os.path.basename(path))
+
+
+def get_wordpress_image_url(media_item: Dict[str, Any]) -> str:
+    source_url = clean_str(media_item.get("source_url"))
+    if source_url:
+        return source_url
+
+    guid = media_item.get("guid") or {}
+    if isinstance(guid, dict):
+        guid_url = clean_str(guid.get("rendered"))
+        if guid_url:
+            return guid_url
+
+    return ""
+
+
+def clean_wp_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, dict):
+        value = value.get("rendered") or ""
+
+    return html.unescape(str(value)).strip()
+
+
+def extract_ean_from_text(value: Any) -> Optional[str]:
+    text = clean_wp_text(value)
+    if not text:
+        return None
+
+    matches = EAN_FROM_MEDIA_RE.findall(text)
+    if not matches:
+        return None
+
+    # Preferenza EAN standard 13 cifre
+    for m in matches:
+        if len(m) == 13:
+            return m
+
+    return matches[0]
+
+
+def extract_ean_from_wordpress_media(media_item: Dict[str, Any]) -> Optional[str]:
+    source_url = get_wordpress_image_url(media_item)
+
+    values_to_check: List[Any] = [
+        extract_filename_from_url(source_url),
+        media_item.get("slug"),
+        media_item.get("title"),
+        media_item.get("alt_text"),
+        source_url,
+    ]
+
+    guid = media_item.get("guid") or {}
+    if isinstance(guid, dict):
+        guid_url = clean_str(guid.get("rendered"))
+        values_to_check.extend([
+            extract_filename_from_url(guid_url),
+            guid_url,
+        ])
+
+    for value in values_to_check:
+        ean = extract_ean_from_text(value)
+        if ean:
+            return ean
+
+    return None
+
+
+def load_wordpress_cover_urls_by_ean() -> Dict[str, str]:
+    """
+    Indicizza una sola volta tutte le immagini WordPress con EAN.
+
+    Ritorna:
+        {
+            "978...": "https://.../immagine.jpg",
+            ...
+        }
+
+    Non filtra formato o dimensione: accetta jpg, png, webp, gif, ecc.
+    In caso di errore WordPress, ritorna mappa vuota e lo script userà
+    il fallback COVER_URL_TEMPLATE.
+    """
+    if not WORDPRESS_COVER_ENABLED:
+        logger.info("WordPress cover disabilitate: WORDPRESS_COVER_ENABLED=0")
+        return {}
+
+    cover_by_ean: Dict[str, str] = {}
+
+    total_seen = 0
+    total_with_ean = 0
+    duplicates = 0
+    without_url = 0
+    without_ean = 0
+
+    page = 1
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 Python Shopify Sync WordPress Cover Indexer"
+    })
+
+    logger.info(f"Indicizzo immagini WordPress da: {WORDPRESS_MEDIA_SEARCH_URL}")
+
+    while True:
+        params = {
+            "media_type": "image",
+            "per_page": WORDPRESS_PER_PAGE,
+            "page": page,
+            "_fields": "id,source_url,slug,title,alt_text,guid,mime_type",
+        }
+
+        try:
+            resp = session.get(
+                WORDPRESS_MEDIA_SEARCH_URL,
+                params=params,
+                timeout=WORDPRESS_REQUEST_TIMEOUT,
+            )
+
+            # WordPress spesso risponde 400 quando la pagina non esiste più
+            if resp.status_code == 400 and page > 1:
+                break
+
+            resp.raise_for_status()
+            data = resp.json()
+
+        except Exception as e:
+            logger.warning(
+                f"Errore lettura immagini WordPress pagina {page}: {e}. "
+                f"Uso fallback COVER_URL_TEMPLATE per le immagini non indicizzate."
+            )
+            break
+
+        if not isinstance(data, list):
+            logger.warning(
+                "Risposta WordPress non valida: attesa lista JSON. "
+                "Uso fallback COVER_URL_TEMPLATE."
+            )
+            break
+
+        if not data:
+            break
+
+        for item in data:
+            if WORDPRESS_LIMIT_MEDIA and total_seen >= WORDPRESS_LIMIT_MEDIA:
+                logger.info("Raggiunto WORDPRESS_LIMIT_MEDIA")
+                break
+
+            total_seen += 1
+
+            image_url = get_wordpress_image_url(item)
+            if not image_url:
+                without_url += 1
+                continue
+
+            ean = extract_ean_from_wordpress_media(item)
+            if not ean:
+                without_ean += 1
+                continue
+
+            total_with_ean += 1
+
+            # In caso di duplicati tiene la prima immagine trovata.
+            if ean in cover_by_ean:
+                duplicates += 1
+                continue
+
+            cover_by_ean[ean] = image_url
+
+        logger.info(
+            f"WordPress pagina {page} letta | "
+            f"media viste={total_seen} | "
+            f"EAN indicizzati={len(cover_by_ean)}"
+        )
+
+        if WORDPRESS_LIMIT_MEDIA and total_seen >= WORDPRESS_LIMIT_MEDIA:
+            break
+
+        total_pages_raw = resp.headers.get("X-WP-TotalPages") or "0"
+        try:
+            total_pages = int(total_pages_raw)
+        except ValueError:
+            total_pages = 0
+
+        if total_pages and page >= total_pages:
+            break
+
+        if not total_pages and len(data) < WORDPRESS_PER_PAGE:
+            break
+
+        page += 1
+
+        if WORDPRESS_SLEEP_BETWEEN_PAGES_MS > 0:
+            time.sleep(WORDPRESS_SLEEP_BETWEEN_PAGES_MS / 1000.0)
+
+    logger.info(
+        "Indice immagini WordPress completato | "
+        f"media viste={total_seen} | "
+        f"con EAN={total_with_ean} | "
+        f"EAN unici={len(cover_by_ean)} | "
+        f"duplicati={duplicates} | "
+        f"senza EAN={without_ean} | "
+        f"senza URL={without_url}"
+    )
+
+    return cover_by_ean
+
+
+# =============================================================================
 # Mapping WinVaria -> Shopify + hash
 # =============================================================================
 
@@ -689,7 +926,8 @@ EXTERNAL_ID_KEY = "external_id"
 def build_productset_input_from_testi_row(
     row: Dict[str, Any],
     *,
-    include_files: bool = True
+    include_files: bool = True,
+    wordpress_cover_by_ean: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     titolo = clean_str(get_ci(row, "TITOLO", default=""))
     sottotitolo = clean_str(get_ci(row, "Sotto_tit", "SOTTO_TIT", "SOTTOTIT", "SOTTOTITOLO", default=""))
@@ -714,8 +952,23 @@ def build_productset_input_from_testi_row(
     sku = ean
     isbn = ean
 
-    cover_url = COVER_URL_TEMPLATE.format(isbn=isbn) if isbn else None
-    cover_filename = f"copertina-{isbn}.jpg" if isbn else "copertina.jpg"
+    # -------------------------------------------------------------------------
+    # COVER:
+    # 1. prima scelta: immagine WordPress indicizzata tramite EAN
+    # 2. fallback: comportamento precedente, cioè COVER_URL_TEMPLATE
+    # -------------------------------------------------------------------------
+    wp_cover_url = ""
+    if isbn and wordpress_cover_by_ean:
+        wp_cover_url = clean_str(wordpress_cover_by_ean.get(isbn))
+
+    if wp_cover_url:
+        cover_url = wp_cover_url
+        wp_filename = extract_filename_from_url(wp_cover_url)
+        cover_filename = wp_filename or f"copertina-{isbn}.jpg"
+    else:
+        cover_url = COVER_URL_TEMPLATE.format(isbn=isbn) if isbn else None
+        cover_filename = f"copertina-{isbn}.jpg" if isbn else "copertina.jpg"
+
     cover_alt = f"Copertina del libro {titolo}".strip()
 
     tags = list(dict.fromkeys([categoria] if categoria else []))
@@ -792,6 +1045,9 @@ def build_productset_input_from_testi_row(
     # L'immagine va inviata a Shopify solo in creazione.
     # In modifica NON bisogna passare il campo "files", così Shopify non tocca
     # l'immagine già presente sul prodotto.
+    #
+    # Se esiste immagine WordPress per l'EAN, usa quella.
+    # Altrimenti mantiene il comportamento precedente con COVER_URL_TEMPLATE.
     if include_files and cover_url:
         input_obj["files"] = [{
             "originalSource": cover_url,
@@ -1047,6 +1303,8 @@ def main() -> None:
     logger.info(f"Config env: {file_path_str(ENV_PATH)}")
     logger.info(f"Log file:   {LOG_PATH}")
     logger.info(f"State DB:   {STATE_DB_PATH}")
+    logger.info(f"WordPress cover enabled: {WORDPRESS_COVER_ENABLED}")
+    logger.info(f"WordPress media URL: {WORDPRESS_MEDIA_SEARCH_URL}")
 
     records = read_testi_records()
     logger.info(f"Record letti con EAN: {len(records)}")
@@ -1054,6 +1312,37 @@ def main() -> None:
     state = SyncState(STATE_DB_PATH)
     run_id = state.start_run()
     prev = state.load_all()
+
+    # -------------------------------------------------------------------------
+    # WordPress viene letto una sola volta e solo se ci sono prodotti nuovi.
+    # Questo evita una chiamata HTTP per ogni prodotto e mantiene il sync veloce
+    # anche con migliaia di record.
+    # -------------------------------------------------------------------------
+    new_eans_preview: set[str] = set()
+    for row in records:
+        ean_preview = clean_str(get_ci(row, "CODICE_EAN", default=""))
+        if ean_preview and ean_preview not in prev:
+            new_eans_preview.add(ean_preview)
+
+    wordpress_cover_by_ean: Dict[str, str] = {}
+
+    if WORDPRESS_COVER_ENABLED and new_eans_preview:
+        wordpress_cover_by_ean = load_wordpress_cover_urls_by_ean()
+
+        wp_hits_for_new = sum(
+            1 for ean in new_eans_preview
+            if ean in wordpress_cover_by_ean
+        )
+
+        logger.info(
+            f"Nuovi prodotti rilevati: {len(new_eans_preview)} | "
+            f"immagini WordPress disponibili per nuovi prodotti: {wp_hits_for_new} | "
+            f"fallback template: {len(new_eans_preview) - wp_hits_for_new}"
+        )
+    elif not new_eans_preview:
+        logger.info("Nessun nuovo prodotto: non indicizzo immagini WordPress")
+    else:
+        logger.info("WordPress cover disabilitate: uso COVER_URL_TEMPLATE per eventuali nuovi prodotti")
 
     if DRY_RUN:
         endpoint = ""
@@ -1107,9 +1396,11 @@ def main() -> None:
                 # L'immagine viene inviata solo in creazione.
                 # In modifica Shopify aggiorna le info del prodotto,
                 # ma non riceve il campo "files" e quindi non tocca l'immagine.
+                # Per i nuovi prodotti: prima immagine WordPress, poi fallback template.
                 "input": build_productset_input_from_testi_row(
                     row,
-                    include_files=is_new
+                    include_files=is_new,
+                    wordpress_cover_by_ean=wordpress_cover_by_ean,
                 ),
                 "is_new": is_new,
             })
