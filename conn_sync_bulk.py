@@ -522,20 +522,25 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
 """.strip()
 
 
-def inventory_set_available_zero_batch(endpoint: str, inventory_item_ids: List[str]) -> Dict[str, Any]:
+def inventory_set_available_batch(
+    endpoint: str,
+    inventory_quantities: List[Tuple[str, int]],
+    *,
+    reference_document_uri: str = "gid://erp-connector/SyncJob/inventory-sync",
+) -> Dict[str, Any]:
     variables = {
         "input": {
             "name": "available",
             "reason": "correction",
-            "referenceDocumentUri": "gid://erp-connector/SyncJob/missing-record",
+            "referenceDocumentUri": reference_document_uri,
             "quantities": [
                 {
                     "inventoryItemId": inv_id,
                     "locationId": SHOPIFY_LOCATION_ID,
-                    "quantity": 0,
+                    "quantity": int(qty),
                     "changeFromQuantity": None
                 }
-                for inv_id in inventory_item_ids
+                for inv_id, qty in inventory_quantities
             ],
         }
     }
@@ -552,6 +557,14 @@ def inventory_set_available_zero_batch(endpoint: str, inventory_item_ids: List[s
         log_error("inventorySetQuantities userErrors (batch)", errs)
 
     return res
+
+
+def inventory_set_available_zero_batch(endpoint: str, inventory_item_ids: List[str]) -> Dict[str, Any]:
+    return inventory_set_available_batch(
+        endpoint,
+        [(inv_id, 0) for inv_id in inventory_item_ids],
+        reference_document_uri="gid://erp-connector/SyncJob/missing-record",
+    )
 
 
 # =============================================================================
@@ -1015,6 +1028,26 @@ def build_productset_input_from_testi_row(
         "value": ean
     })
 
+    variant_obj: Dict[str, Any] = {
+        "sku": sku,
+        "price": f"{float(prezzo):.2f}",
+        "optionValues": [{"optionName": "Title", "name": "Default Title"}],
+    }
+
+    if is_scolastico(row):
+        # Prodotti SCOLASTICO: scorte non monitorate e prodotto sempre acquistabile.
+        # - tracked=False disattiva il tracking inventario sull'inventory item.
+        # - inventoryPolicy=CONTINUE consente l'acquisto anche senza disponibilità.
+        # - non inviamo inventoryQuantities perché la scorta non deve essere gestita.
+        variant_obj["inventoryItem"] = {"tracked": False}
+        variant_obj["inventoryPolicy"] = "CONTINUE"
+    else:
+        variant_obj["inventoryQuantities"] = [{
+            "locationId": SHOPIFY_LOCATION_ID,
+            "name": "available",
+            "quantity": int(giacenza),
+        }]
+
     input_obj: Dict[str, Any] = {
         "title": titolo or f"Libro {ean}",
         "descriptionHtml": description_html,
@@ -1028,16 +1061,7 @@ def build_productset_input_from_testi_row(
             "position": 1,
             "values": [{"name": "Default Title"}]
         }],
-        "variants": [{
-            "sku": sku,
-            "price": f"{float(prezzo):.2f}",
-            "optionValues": [{"optionName": "Title", "name": "Default Title"}],
-            "inventoryQuantities": [{
-                "locationId": SHOPIFY_LOCATION_ID,
-                "name": "available",
-                "quantity": int(giacenza),
-            }],
-        }],
+        "variants": [variant_obj],
         "metafields": metafields,
     }
 
@@ -1058,17 +1082,25 @@ def build_productset_input_from_testi_row(
     return input_obj
 
 
+def get_row_stock_quantity(row: Dict[str, Any]) -> int:
+    return int(get_ci(row, "GIACENTI", default=0) or 0)
+
+
+def is_scolastico(row: Dict[str, Any]) -> bool:
+    # Il valore arriva da tipologie.dbf ed è salvato in CATEGORIA.
+    return clean_str(get_ci(row, "CATEGORIA", default="")).upper() == "SCOLASTICO"
+
+
 def compute_row_hash(row: Dict[str, Any]) -> str:
+    # Per i prodotti già esistenti il monitoraggio del cambiamento deve
+    # dipendere solo dalla giacenza. Titolo, descrizione, prezzo, autore,
+    # categoria, note, immagini e metafield non devono più causare update
+    # del prodotto su Shopify.
     payload = {
         "ean": clean_str(get_ci(row, "CODICE_EAN", default="")),
-        "titolo": clean_str(get_ci(row, "TITOLO", default="")),
-        "sottotitolo": clean_str(get_ci(row, "Sotto_tit", "SOTTO_TIT", "SOTTOTIT", "SOTTOTITOLO", default="")),
-        "autore": clean_str(get_ci(row, "AUTORE", default="")),
-        "editore": clean_str(get_ci(row, "EDITORE", default="")),
-        "categoria": clean_str(get_ci(row, "CATEGORIA", default="")),
-        "prezzo": float(get_ci(row, "PREZZO_EUR", default=0.0) or 0.0),
-        "giacenza": int(get_ci(row, "GIACENTI", default=0) or 0),
-        "note": clean_str(get_ci(row, "NOTE_TEXT", default="")),
+        # Per SCOLASTICO la scorta non è monitorata su Shopify, quindi la
+        # giacenza del DBF non deve generare update futuri.
+        "giacenza": None if is_scolastico(row) else get_row_stock_quantity(row),
     }
     s = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -1363,7 +1395,8 @@ def main() -> None:
     unchanged = 0
     zeroed = 0
 
-    to_upsert: List[Dict[str, Any]] = []
+    to_create: List[Dict[str, Any]] = []
+    to_inventory_update: List[Dict[str, Any]] = []
     unchanged_rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]] = []
 
     for row in records:
@@ -1375,11 +1408,12 @@ def main() -> None:
 
         h = compute_row_hash(row)
         prev_item = prev.get(ean)
+        is_scolastico_row = is_scolastico(row)
 
         is_new = prev_item is None
         is_changed = (not is_new) and (prev_item.get("row_hash") != h)
 
-        if (not is_new) and (not is_changed):
+        if (not is_new) and (is_scolastico_row or not is_changed):
             unchanged += 1
             unchanged_rows.append((
                 run_id,
@@ -1389,20 +1423,31 @@ def main() -> None:
                 prev_item.get("variant_id"),
                 prev_item.get("inventory_item_id")
             ))
-        else:
-            to_upsert.append({
+        elif is_new:
+            to_create.append({
                 "ean": ean,
                 "row_hash": h,
-                # L'immagine viene inviata solo in creazione.
-                # In modifica Shopify aggiorna le info del prodotto,
-                # ma non riceve il campo "files" e quindi non tocca l'immagine.
+                # I prodotti nuovi vengono creati con scheda completa.
                 # Per i nuovi prodotti: prima immagine WordPress, poi fallback template.
                 "input": build_productset_input_from_testi_row(
                     row,
-                    include_files=is_new,
+                    include_files=True,
                     wordpress_cover_by_ean=wordpress_cover_by_ean,
                 ),
-                "is_new": is_new,
+                "is_new": True,
+            })
+        else:
+            # Prodotto già creato: da questo punto in poi NON aggiorniamo più
+            # titolo, descrizione, prezzo, autore, categoria, note, metafield
+            # o immagini. Se cambia qualcosa nel DBF, lo state considera solo
+            # la giacenza e su Shopify inviamo solo inventorySetQuantities.
+            to_inventory_update.append({
+                "ean": ean,
+                "row_hash": h,
+                "quantity": get_row_stock_quantity(row),
+                "product_id": prev_item.get("product_id"),
+                "variant_id": prev_item.get("variant_id"),
+                "inventory_item_id": prev_item.get("inventory_item_id"),
             })
 
     try:
@@ -1410,18 +1455,26 @@ def main() -> None:
             state.upsert_items_many(chunk)
 
         if DRY_RUN:
-            sim = [(run_id, it["ean"], it["row_hash"], None, None, None) for it in to_upsert]
-            for chunk in chunked(sim, SQLITE_UPSERT_BATCH):
+            sim_create = [(run_id, it["ean"], it["row_hash"], None, None, None) for it in to_create]
+            sim_inventory = [
+                (run_id, it["ean"], it["row_hash"], it.get("product_id"), it.get("variant_id"), it.get("inventory_item_id"))
+                for it in to_inventory_update
+            ]
+            for chunk in chunked(sim_create + sim_inventory, SQLITE_UPSERT_BATCH):
                 state.upsert_items_many(chunk)
         else:
             if not BULK_ENABLED:
                 raise RuntimeError("BULK_ENABLED=0 ma bulk richiesto: imposta BULK_ENABLED=1")
 
+            # -----------------------------------------------------------------
+            # 1) CREAZIONE prodotti nuovi: productSet completo.
+            #    Nessun prodotto già esistente passa più da productSet.
+            # -----------------------------------------------------------------
             publish_queue: List[str] = []
-            logger.info(f"Bulk productSet: {len(to_upsert)} (chunk={BULK_CHUNK_SIZE})")
-            total_chunks = (len(to_upsert) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE if to_upsert else 0
+            logger.info(f"Bulk productSet nuovi prodotti: {len(to_create)} (chunk={BULK_CHUNK_SIZE})")
+            total_chunks = (len(to_create) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE if to_create else 0
 
-            for chunk_idx, chunk_items in enumerate(chunked(to_upsert, BULK_CHUNK_SIZE), start=1):
+            for chunk_idx, chunk_items in enumerate(chunked(to_create, BULK_CHUNK_SIZE), start=1):
                 t_chunk0 = time.perf_counter()
                 chunk_log("productSet", chunk_idx, total_chunks, "inizio elaborazione")
 
@@ -1437,13 +1490,6 @@ def main() -> None:
                     isnew_by_ean[ean] = bool(it["is_new"])
 
                     input_obj = dict(it["input"])
-
-                    # Protezione extra:
-                    # se il prodotto non è nuovo, rimuoviamo comunque "files"
-                    # prima di inviare la mutation a Shopify.
-                    # Così un aggiornamento non potrà mai modificare l'immagine.
-                    if not bool(it["is_new"]):
-                        input_obj.pop("files", None)
 
                     lines.append(json.dumps({
                         "identifier": {
@@ -1508,13 +1554,7 @@ def main() -> None:
                         log_error(f"productSet product_id NULL (EAN={ean})", out_line)
                         continue
 
-                    variant_id = None
-                    inventory_item_id = None
-                    variants = (((product.get("variants") or {}).get("nodes")) or [])
-                    if variants:
-                        v0 = variants[0] or {}
-                        variant_id = v0.get("id")
-                        inventory_item_id = ((v0.get("inventoryItem") or {}).get("id"))
+                    product_id, variant_id, inventory_item_id = pick_ids_from_product_node(product, ean)
 
                     upsert_rows.append((
                         run_id,
@@ -1525,12 +1565,9 @@ def main() -> None:
                         inventory_item_id
                     ))
 
-                    if isnew_by_ean.get(ean):
-                        created += 1
-                        if PUBLICATION_IDS:
-                            publish_queue.append(product_id)
-                    else:
-                        updated += 1
+                    created += 1
+                    if PUBLICATION_IDS:
+                        publish_queue.append(product_id)
 
                 for sub in chunked(upsert_rows, SQLITE_UPSERT_BATCH):
                     state.upsert_items_many(sub)
@@ -1539,6 +1576,52 @@ def main() -> None:
                     "productSet",
                     chunk_idx,
                     total_chunks,
+                    f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s"
+                )
+
+            # -----------------------------------------------------------------
+            # 2) AGGIORNAMENTO prodotti esistenti: solo giacenza.
+            #    Qui non vengono inviati title, descriptionHtml, vendor, price,
+            #    metafield, tags o files.
+            # -----------------------------------------------------------------
+            logger.info(f"Aggiornamento sole giacenze prodotti esistenti: {len(to_inventory_update)}")
+            inv_updates = [
+                it for it in to_inventory_update
+                if it.get("inventory_item_id")
+            ]
+            missing_inv = [it for it in to_inventory_update if not it.get("inventory_item_id")]
+            for it in missing_inv:
+                log_error(
+                    f"Impossibile aggiornare solo giacenza: inventory_item_id mancante (EAN={it['ean']})",
+                    {"ean": it["ean"], "product_id": it.get("product_id"), "variant_id": it.get("variant_id")}
+                )
+
+            inv_total = (len(inv_updates) + INVENTORY_ZERO_BATCH - 1) // INVENTORY_ZERO_BATCH if inv_updates else 0
+            for chunk_idx, batch in enumerate(chunked(inv_updates, INVENTORY_ZERO_BATCH), start=1):
+                t_chunk0 = time.perf_counter()
+                chunk_log("inventory", chunk_idx, inv_total, "inizio aggiornamento giacenze")
+
+                res = inventory_set_available_batch(
+                    endpoint,
+                    [(it["inventory_item_id"], it["quantity"]) for it in batch],
+                    reference_document_uri=f"gid://erp-connector/SyncJob/run-{run_id}-inventory",
+                )
+                errs = ((res.get("data") or {}).get("inventorySetQuantities") or {}).get("userErrors") or []
+                if errs:
+                    continue
+
+                updated += len(batch)
+                upsert_rows = [
+                    (run_id, it["ean"], it["row_hash"], it.get("product_id"), it.get("variant_id"), it.get("inventory_item_id"))
+                    for it in batch
+                ]
+                for sub in chunked(upsert_rows, SQLITE_UPSERT_BATCH):
+                    state.upsert_items_many(sub)
+
+                chunk_log(
+                    "inventory",
+                    chunk_idx,
+                    inv_total,
                     f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s"
                 )
 
