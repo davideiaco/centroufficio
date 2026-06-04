@@ -1,0 +1,4 @@
+exe:
+
+python -m pip install pyinstaller
+python -m PyInstaller --onefile conn_sync_bulk.py
