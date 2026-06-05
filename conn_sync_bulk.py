@@ -935,6 +935,28 @@ def load_wordpress_cover_urls_by_ean() -> Dict[str, str]:
 EXTERNAL_ID_NAMESPACE = "custom"
 EXTERNAL_ID_KEY = "external_id"
 
+def text_to_shopify_html(value: Any) -> str:
+
+    text = str(value or "")
+    text = text.replace("\x00", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if not text:
+        return ""
+
+    paragraphs = re.split(r"\n[ \t]*\n+", text)
+    html_paragraphs: List[str] = []
+
+    for paragraph in paragraphs:
+        lines = paragraph.split("\n")
+        escaped_lines = [html.escape(line.strip()) for line in lines]
+        escaped_lines = [line for line in escaped_lines if line != ""]
+
+        if escaped_lines:
+            html_paragraphs.append("<p>" + "<br>".join(escaped_lines) + "</p>")
+
+    return "\n".join(html_paragraphs)
+
 
 def build_productset_input_from_testi_row(
     row: Dict[str, Any],
@@ -958,7 +980,7 @@ def build_productset_input_from_testi_row(
     if sottotitolo:
         description_parts.append(f"<p><strong>{html.escape(sottotitolo)}</strong></p>")
     if note:
-        description_parts.append(f"<p>{html.escape(note)}</p>")
+        description_parts.append(text_to_shopify_html(note))
 
     description_html = "\n".join(description_parts) if description_parts else "<p></p>"
 
