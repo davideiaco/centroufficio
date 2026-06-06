@@ -958,6 +958,23 @@ def text_to_shopify_html(value: Any) -> str:
     return "\n".join(html_paragraphs)
 
 
+
+
+def to_money_float(value: Any, default: float = 0.0) -> float:
+    """Converte valori numerici DBF in float, gestendo anche stringhe con virgola."""
+    if value is None:
+        return default
+
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace(",", ".")
+            if not value:
+                return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_productset_input_from_testi_row(
     row: Dict[str, Any],
     *,
@@ -971,7 +988,11 @@ def build_productset_input_from_testi_row(
     categoria = clean_str(get_ci(row, "CATEGORIA", default=""))
 
     ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
-    prezzo = get_ci(row, "PREZZO_EUR", default=0.0) or 0.0
+    prezzo = to_money_float(get_ci(row, "PREZZO_EUR", default=0.0), 0.0)
+    sconto = to_money_float(get_ci(row, "SCONTO", "Sconto", "sconto", default=0.0), 0.0)
+    if sconto < 0:
+        sconto = 0.0
+    prezzo_finale = max(prezzo - sconto, 0.0)
     giacenza = get_ci(row, "GIACENTI", default=0) or 0
 
     note = clean_str(get_ci(row, "NOTE_TEXT", default=""))
@@ -1052,9 +1073,15 @@ def build_productset_input_from_testi_row(
 
     variant_obj: Dict[str, Any] = {
         "sku": sku,
-        "price": f"{float(prezzo):.2f}",
+        # Prezzo effettivo Shopify: prezzo DBF meno eventuale sconto.
+        "price": f"{prezzo_finale:.2f}",
         "optionValues": [{"optionName": "Title", "name": "Default Title"}],
     }
+
+    # Se c'è uno sconto, Shopify mostra il prezzo originario come
+    # prezzo di confronto / prezzo barrato.
+    if sconto > 0 and prezzo_finale < prezzo:
+        variant_obj["compareAtPrice"] = f"{prezzo:.2f}"
 
     if is_scolastico(row):
         # Prodotti SCOLASTICO: scorte non monitorate e prodotto sempre acquistabile.
