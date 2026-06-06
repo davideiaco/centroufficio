@@ -1,3 +1,10 @@
+# =============================================================================
+# VERSIONE VERIFICATA - sconti percentuali DBF
+# - SCONTO letto come percentuale, anche con virgola: 5,04 / 5,04%
+# - Calcolo con Decimal, senza float
+# - Prezzo finale troncato a 2 decimali con ROUND_DOWN, non arrotondato
+#   Esempio: 17.90 con 5% = 17.005 -> 17.00
+# =============================================================================
 from dotenv import load_dotenv
 from pathlib import Path
 import sys
@@ -12,7 +19,7 @@ import sqlite3
 import requests
 import time
 import logging
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from urllib.parse import urlparse, unquote
@@ -1020,8 +1027,8 @@ def clamp_percent(value: Decimal) -> Decimal:
 
 
 def money_str(value: Decimal) -> str:
-    rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return f"{rounded:.2f}"
+    truncated = value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return f"{truncated:.2f}"
 
 
 def build_productset_input_from_testi_row(
@@ -1040,7 +1047,7 @@ def build_productset_input_from_testi_row(
     prezzo = to_decimal(get_ci(row, "PREZZO_EUR", "Prezzo_eur", "prezzo_eur", "PREZZO", default=Decimal("0")))
     sconto_percentuale = to_decimal(get_ci(row, "SCONTO", "Sconto", "sconto", default=Decimal("0")))
     # Il campo SCONTO nel DBF contiene una percentuale, es. 5,04 = 5,04%.
-    # Usiamo Decimal per non perdere precisione e arrotondiamo solo alla fine a 2 decimali.
+    # Usiamo Decimal per non perdere precisione e tronchiamo solo alla fine a 2 decimali.
     sconto_percentuale = clamp_percent(sconto_percentuale)
 
     if prezzo < Decimal("0"):
