@@ -12,6 +12,7 @@ import sqlite3
 import requests
 import time
 import logging
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from urllib.parse import urlparse, unquote
@@ -350,7 +351,8 @@ def parse_record(
             out[name] = raw.decode("cp1252", errors="ignore").rstrip()
         elif ftype == "N":
             s = raw.decode("ascii", errors="ignore").strip()
-            out[name] = float(s) if s else None
+            # Mantiene esatti i decimali del DBF (prezzi/sconti), senza passare da float.
+            out[name] = Decimal(s.replace(",", ".")) if s else None
         elif ftype == "I":
             out[name] = struct.unpack("<i", raw)[0]
         elif ftype == "D":
@@ -960,19 +962,66 @@ def text_to_shopify_html(value: Any) -> str:
 
 
 
-def to_money_float(value: Any, default: float = 0.0) -> float:
-    """Converte valori numerici DBF in float, gestendo anche stringhe con virgola."""
+def normalize_decimal_text(value: str) -> str:
+    """
+    Normalizza numeri scritti in formato italiano o internazionale senza usare float.
+
+    Esempi gestiti:
+    - 5,04      -> 5.04
+    - 5.04      -> 5.04
+    - 5,04%     -> 5.04
+    - 5.04%     -> 5.04
+    - 1.234,56  -> 1234.56
+    - 1,234.56  -> 1234.56
+    """
+    s = str(value or "").strip()
+    s = s.replace("\u00a0", "")
+    s = s.replace("%", "")
+    s = s.replace("€", "")
+    s = s.replace(" ", "")
+
+    if not s:
+        return ""
+
+    # Se ci sono sia virgola sia punto, considera l'ultimo separatore come
+    # separatore decimale e l'altro come separatore delle migliaia.
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+
+    return s
+
+
+def to_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
     if value is None:
         return default
-
     try:
+        if isinstance(value, Decimal):
+            return value
         if isinstance(value, str):
-            value = value.strip().replace(",", ".")
+            value = normalize_decimal_text(value)
             if not value:
                 return default
-        return float(value)
-    except (TypeError, ValueError):
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
         return default
+
+
+def clamp_percent(value: Decimal) -> Decimal:
+    if value < Decimal("0"):
+        return Decimal("0")
+    if value > Decimal("100"):
+        return Decimal("100")
+    return value
+
+
+def money_str(value: Decimal) -> str:
+    rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{rounded:.2f}"
 
 
 def build_productset_input_from_testi_row(
@@ -988,11 +1037,18 @@ def build_productset_input_from_testi_row(
     categoria = clean_str(get_ci(row, "CATEGORIA", default=""))
 
     ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
-    prezzo = to_money_float(get_ci(row, "PREZZO_EUR", default=0.0), 0.0)
-    sconto = to_money_float(get_ci(row, "SCONTO", "Sconto", "sconto", default=0.0), 0.0)
-    if sconto < 0:
-        sconto = 0.0
-    prezzo_finale = max(prezzo - sconto, 0.0)
+    prezzo = to_decimal(get_ci(row, "PREZZO_EUR", "Prezzo_eur", "prezzo_eur", "PREZZO", default=Decimal("0")))
+    sconto_percentuale = to_decimal(get_ci(row, "SCONTO", "Sconto", "sconto", default=Decimal("0")))
+    # Il campo SCONTO nel DBF contiene una percentuale, es. 5,04 = 5,04%.
+    # Usiamo Decimal per non perdere precisione e arrotondiamo solo alla fine a 2 decimali.
+    sconto_percentuale = clamp_percent(sconto_percentuale)
+
+    if prezzo < Decimal("0"):
+        prezzo = Decimal("0")
+
+    prezzo_finale = prezzo * (Decimal("1") - (sconto_percentuale / Decimal("100")))
+    if prezzo_finale < Decimal("0"):
+        prezzo_finale = Decimal("0")
     giacenza = get_ci(row, "GIACENTI", default=0) or 0
 
     note = clean_str(get_ci(row, "NOTE_TEXT", default=""))
@@ -1073,15 +1129,15 @@ def build_productset_input_from_testi_row(
 
     variant_obj: Dict[str, Any] = {
         "sku": sku,
-        # Prezzo effettivo Shopify: prezzo DBF meno eventuale sconto.
-        "price": f"{prezzo_finale:.2f}",
+        # Prezzo effettivo Shopify: prezzo DBF meno sconto percentuale.
+        "price": money_str(prezzo_finale),
         "optionValues": [{"optionName": "Title", "name": "Default Title"}],
     }
 
-    # Se c'è uno sconto, Shopify mostra il prezzo originario come
+    # Se c'è uno sconto percentuale, Shopify mostra il prezzo originario come
     # prezzo di confronto / prezzo barrato.
-    if sconto > 0 and prezzo_finale < prezzo:
-        variant_obj["compareAtPrice"] = f"{prezzo:.2f}"
+    if sconto_percentuale > 0 and prezzo_finale < prezzo:
+        variant_obj["compareAtPrice"] = money_str(prezzo)
 
     if is_scolastico(row):
         # Prodotti SCOLASTICO: scorte non monitorate e prodotto sempre acquistabile.
