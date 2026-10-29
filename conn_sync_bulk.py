@@ -159,6 +159,7 @@ WORDPRESS_MEDIA_SEARCH_URL = _env(
 )
 WORDPRESS_PER_PAGE = _env_int("WORDPRESS_PER_PAGE", "100")
 WORDPRESS_REQUEST_TIMEOUT = _env_int("WORDPRESS_REQUEST_TIMEOUT", "60")
+WORDPRESS_INDEX_TIMEOUT_SECONDS = _env_int("WORDPRESS_INDEX_TIMEOUT_SECONDS", "1800")
 WORDPRESS_SLEEP_BETWEEN_PAGES_MS = _env_int("WORDPRESS_SLEEP_BETWEEN_PAGES_MS", "100")
 WORDPRESS_LIMIT_MEDIA = _env_int("WORDPRESS_LIMIT_MEDIA", "0")
 EAN_FROM_MEDIA_RE = re.compile(r"(\d{8,18})")
@@ -171,6 +172,8 @@ BULK_ENABLED = _env_bool("BULK_ENABLED", "1")
 BULK_CHUNK_SIZE = _env_int("BULK_CHUNK_SIZE", "5000")
 SQLITE_UPSERT_BATCH = _env_int("SQLITE_UPSERT_BATCH", "2000")
 INVENTORY_ZERO_BATCH = _env_int("INVENTORY_ZERO_BATCH", "200")
+# Tempo massimo (secondi) di attesa per ogni operazione bulk Shopify.
+BULK_POLL_TIMEOUT_SECONDS = _env_int("BULK_POLL_TIMEOUT_SECONDS", "7200")
 
 
 # =============================================================================
@@ -701,15 +704,34 @@ def bulk_run_mutation(
 
 
 def poll_bulk_operation(endpoint: str, token: str, op_id: str, *, poll_seconds: int = 5) -> Dict[str, Any]:
+    start = time.monotonic()
+    last_log = start
+    last_status = None
+    timeout_s = max(1, BULK_POLL_TIMEOUT_SECONDS)
+
     while True:
+        if time.monotonic() - start >= timeout_s:
+            raise TimeoutError(f"Bulk Shopify {op_id}: attesa superata ({timeout_s}s), ultimo stato={last_status}")
+
         res = shopify_graphql(endpoint, token, QUERY_BULK_OPERATION, {"id": op_id})
         op = (res.get("data") or {}).get("bulkOperation") or {}
-        status = (op.get("status") or "").upper()
+        status = (op.get("status") or "SCONOSCIUTO").upper()
+        now = time.monotonic()
+
+        # Registra i cambi di stato e un messaggio ogni minuto durante l'attesa.
+        if status != last_status or now - last_log >= 60:
+            logger.info(f"Bulk Shopify {op_id} | stato={status} | "
+                        f"oggetti={op.get('objectCount')} | attesa={int(now - start)}s")
+            last_log = now
+            last_status = status
 
         if status in ("COMPLETED", "FAILED", "CANCELED", "CANCELLED"):
             return op
 
-        time.sleep(poll_seconds)
+        if now - start >= timeout_s:
+            raise TimeoutError(f"Bulk Shopify {op_id}: attesa superata ({timeout_s}s), ultimo stato={status}")
+
+        time.sleep(min(poll_seconds, max(0, timeout_s - (now - start))))
 
 
 def iter_jsonl_from_url(url: str) -> Iterable[Dict[str, Any]]:
@@ -833,7 +855,11 @@ def load_wordpress_cover_urls_by_ean() -> Dict[str, str]:
 
     logger.info(f"Indicizzo immagini WordPress da: {WORDPRESS_MEDIA_SEARCH_URL}")
 
+    wp_index_start = time.monotonic()
     while True:
+        if time.monotonic() - wp_index_start >= max(1, WORDPRESS_INDEX_TIMEOUT_SECONDS):
+            logger.warning("Tempo massimo indicizzazione WordPress raggiunto: uso il fallback per le copertine mancanti")
+            break
         params = {
             "media_type": "image",
             "per_page": WORDPRESS_PER_PAGE,
@@ -1631,6 +1657,7 @@ def main() -> None:
                     client_identifier=f"productset_run{run_id}_chunk{chunk_idx}"
                 )
 
+                logger.info(f"[productSet] Chunk {chunk_idx}/{total_chunks} | bulk avviata: {op_id}")
                 op = poll_bulk_operation(endpoint, SHOPIFY_ACCESS_TOKEN, op_id)
                 status = (op.get("status") or "").upper()
                 if status != "COMPLETED":
@@ -1644,6 +1671,7 @@ def main() -> None:
 
                 upsert_rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]] = []
 
+                logger.info(f"[productSet] Chunk {chunk_idx}/{total_chunks} | scarico risultati bulk")
                 for i, out_line in enumerate(iter_jsonl_from_url(out_url)):
                     if i >= len(eans_in_order):
                         break
@@ -1769,6 +1797,7 @@ def main() -> None:
                         client_identifier=f"publish_run{run_id}_chunk{chunk_idx}"
                     )
 
+                    logger.info(f"[publish] Chunk {chunk_idx}/{publish_total} | bulk avviata: {op_id}")
                     op = poll_bulk_operation(endpoint, SHOPIFY_ACCESS_TOKEN, op_id)
                     status = (op.get("status") or "").upper()
                     if status != "COMPLETED":
@@ -1777,6 +1806,7 @@ def main() -> None:
 
                     out_url = op.get("url")
                     if out_url:
+                        logger.info(f"[publish] Chunk {chunk_idx}/{publish_total} | scarico risultati bulk")
                         for out_line in iter_jsonl_from_url(out_url):
                             uerrs = ((out_line.get("data") or {}).get("publishablePublish") or {}).get("userErrors") or []
                             if uerrs:
@@ -1804,8 +1834,8 @@ def main() -> None:
                 if not errs:
                     zeroed += len(batch)
 
-    except Exception as e:
-        log_error("ERRORE FATALE durante sync", {"error": str(e)})
+    except Exception:
+        logger.exception("ERRORE FATALE durante sync")
         raise
     finally:
         state.finish_run(run_id)
@@ -1819,7 +1849,36 @@ def main() -> None:
     logger.info(f"Log file:   {LOG_PATH}")
 
 
+def try_acquire_single_instance_lock():
+    """Evita due sincronizzazioni contemporanee, anche se avviate dal Task Scheduler."""
+    lock_file = open(APP_DIR / "shopify_sync.lock", "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            if not lock_file.read(1):
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        lock_file.close()
+        # Blocco gia' acquisito da un'altra istanza.
+        if getattr(e, "winerror", None) in (32, 33, 36) or getattr(e, "errno", None) in (11, 13):
+            return None
+        raise
+    return lock_file
+
+
 if __name__ == "__main__":
+    instance_lock = try_acquire_single_instance_lock()
+    if instance_lock is None:
+        logger.error("Sync NON avviata: un'altra istanza dello script e' ancora in esecuzione")
+        sys.exit(2)
+
     try:
         main()
     except Exception:
@@ -1833,9 +1892,6 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        if is_running_as_exe():
-            try:
-                input("\nPremi Invio per chiudere...")
-            except EOFError:
-                pass
         raise
+    finally:
+        instance_lock.close()  # Il sistema operativo rilascia automaticamente il lock.
