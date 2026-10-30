@@ -1,5 +1,6 @@
 # =============================================================================
-# VERSIONE VERIFICATA - sconti percentuali DBF
+# VERSIONE SICURA V2 - migrazione da conn_sync_bulk originale
+# Inventory ID riparati per SKU, bulk per __lineNumber, batch resilienti
 # - SCONTO letto come percentuale, anche con virgola: 5,04 / 5,04%
 # - Calcolo con Decimal, senza float
 # - Prezzo finale troncato a 2 decimali con ROUND_DOWN, non arrotondato
@@ -15,6 +16,7 @@ import json
 import struct
 import datetime
 import hashlib
+import uuid
 import sqlite3
 import requests
 import time
@@ -174,6 +176,17 @@ SQLITE_UPSERT_BATCH = _env_int("SQLITE_UPSERT_BATCH", "2000")
 INVENTORY_ZERO_BATCH = _env_int("INVENTORY_ZERO_BATCH", "200")
 # Tempo massimo (secondi) di attesa per ogni operazione bulk Shopify.
 BULK_POLL_TIMEOUT_SECONDS = _env_int("BULK_POLL_TIMEOUT_SECONDS", "7200")
+
+# Sicurezza per sincronizzazioni frequenti. Gli azzeramenti degli EAN scomparsi
+# sono inizialmente disattivati: lo stato esistente contiene associazioni duplicate.
+ZERO_MISSING_PRODUCTS = _env_bool("ZERO_MISSING_PRODUCTS", "0")
+REPAIR_COOLDOWN_MINUTES = _env_int("REPAIR_COOLDOWN_MINUTES", "60")
+VERIFY_LINK_TTL_DAYS = _env_int("VERIFY_LINK_TTL_DAYS", "1")
+MAX_NEW_PRODUCTS_PER_RUN = _env_int("MAX_NEW_PRODUCTS_PER_RUN", "500")
+CHECK_ONLY = "--check" in sys.argv or "--dry-run" in sys.argv
+if CHECK_ONLY:
+    DRY_RUN = True
+
 
 
 # =============================================================================
@@ -446,6 +459,10 @@ def load_tipologie_map(dbf_path: str) -> Dict[int, str]:
 # Shopify GraphQL (retry) + error logs + auto refresh token
 # =============================================================================
 
+class ShopifyGraphQLApplicationError(RuntimeError):
+    """Errore GraphQL applicativo non ritentabile automaticamente."""
+
+
 def shopify_graphql(
     endpoint: str,
     token: str,
@@ -458,21 +475,16 @@ def shopify_graphql(
 
     current_token = token
     auth_refresh_done = False
-
     for attempt in range(max_retries):
-        headers = {
-            "Content-Type": "application/json",
-            "X-Shopify-Access-Token": current_token
-        }
-
         try:
+            headers = {
+                "Content-Type": "application/json",
+                "X-Shopify-Access-Token": current_token
+            }
             resp = requests.post(
-                endpoint,
-                headers=headers,
-                json={"query": query, "variables": variables},
-                timeout=180
+                endpoint, headers=headers,
+                json={"query": query, "variables": variables}, timeout=180
             )
-
             if _is_auth_http_error(resp):
                 if auth_refresh_done:
                     resp.raise_for_status()
@@ -484,41 +496,45 @@ def shopify_graphql(
 
             if resp.status_code in (429, 500, 502, 503, 504):
                 raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
-
             resp.raise_for_status()
             data = resp.json()
 
             if _graphql_has_auth_error(data):
                 if auth_refresh_done:
-                    log_error("Errore autenticazione Shopify anche dopo refresh token", data)
-                    raise RuntimeError("Autenticazione Shopify fallita anche dopo refresh token")
-
+                    raise ShopifyGraphQLApplicationError("Autenticazione Shopify fallita dopo refresh token")
                 current_token = refresh_shopify_access_token()
                 SHOPIFY_ACCESS_TOKEN = current_token
                 auth_refresh_done = True
-                logger.info("Retry GraphQL dopo refresh token per errore auth applicativo")
+                logger.info("Retry Shopify GraphQL dopo refresh token")
                 continue
 
-            if "errors" in data and data["errors"]:
-                log_error("GraphQL top-level errors", data["errors"])
-
+            if data.get("errors"):
+                errors = data["errors"]
+                is_throttled = all(
+                    str((err.get("extensions") or {}).get("code") or "").upper() == "THROTTLED"
+                    for err in errors if isinstance(err, dict)
+                )
+                if is_throttled and attempt < max_retries - 1:
+                    logger.warning("Shopify GraphQL throttled; nuovo tentativo con backoff")
+                    time.sleep(min(2 ** attempt, 30))
+                    continue
+                log_error("GraphQL top-level errors", errors)
+                raise ShopifyGraphQLApplicationError("Shopify GraphQL ha restituito errori top-level")
+            if not isinstance(data.get("data"), dict):
+                raise ShopifyGraphQLApplicationError("Shopify non ha restituito un payload data valido")
             return data
-
+        except ShopifyGraphQLApplicationError:
+            raise
         except Exception as e:
             if attempt >= max_retries - 1:
-                log_error(
-                    "Errore chiamata Shopify GraphQL (ultimo tentativo)",
-                    {
-                        "error": str(e),
-                        "status": getattr(getattr(e, "response", None), "status_code", None)
-                    }
-                )
+                log_error("Errore chiamata Shopify GraphQL (ultimo tentativo)", {
+                    "error": str(e),
+                    "status": getattr(getattr(e, "response", None), "status_code", None)
+                })
                 raise
+            time.sleep(min(2 ** attempt, 30))
 
-            sleep_s = min(2 ** attempt, 30)
-            time.sleep(sleep_s)
-
-    raise RuntimeError("Unreachable")
+    raise RuntimeError("Numero massimo tentativi Shopify esaurito")
 
 
 # =============================================================================
@@ -526,8 +542,8 @@ def shopify_graphql(
 # =============================================================================
 
 MUTATION_INVENTORY_SET_QUANTITIES = """
-mutation InventorySet($input: InventorySetQuantitiesInput!) {
-  inventorySetQuantities(input: $input) {
+mutation InventorySet($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+  inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
     userErrors { field message code }
   }
 }
@@ -540,43 +556,46 @@ def inventory_set_available_batch(
     *,
     reference_document_uri: str = "gid://erp-connector/SyncJob/inventory-sync",
 ) -> Dict[str, Any]:
+    """Idempotenza: i retry della stessa chiamata usano la stessa chiave.
+
+    WinVaria e' la fonte autoritativa delle giacenze: changeFromQuantity null
+    evita il confronto con il valore Shopify, che puo' cambiare tra i cicli.
+    """
+    if not inventory_quantities:
+        raise ValueError("Impossibile inviare un inventario vuoto")
+
+    q = [{
+        "inventoryItemId": inv_id,
+        "locationId": SHOPIFY_LOCATION_ID,
+        "quantity": int(qty),
+        "changeFromQuantity": None
+    } for inv_id, qty in inventory_quantities]
+    ids = [v["inventoryItemId"] for v in q]
+    if len(ids) != len(set(ids)):
+        raise ValueError("InventoryItem ID duplicati nella stessa chiamata: blocco di sicurezza")
+
+    # Chiave stabile per retry di questa stessa richiesta, diversa per run/batch.
+    key_material = reference_document_uri + "|" + json.dumps(q, sort_keys=True)
+    idem = str(uuid.uuid5(uuid.NAMESPACE_URL, key_material))
     variables = {
+        "idempotencyKey": idem,
         "input": {
-            "name": "available",
-            "reason": "correction",
+            "name": "available", "reason": "correction",
             "referenceDocumentUri": reference_document_uri,
-            "quantities": [
-                {
-                    "inventoryItemId": inv_id,
-                    "locationId": SHOPIFY_LOCATION_ID,
-                    "quantity": int(qty),
-                    "changeFromQuantity": None
-                }
-                for inv_id, qty in inventory_quantities
-            ],
+            "quantities": q
         }
     }
-
-    res = shopify_graphql(
-        endpoint,
-        SHOPIFY_ACCESS_TOKEN,
-        MUTATION_INVENTORY_SET_QUANTITIES,
-        variables
+    return shopify_graphql(
+        endpoint, SHOPIFY_ACCESS_TOKEN,
+        MUTATION_INVENTORY_SET_QUANTITIES, variables
     )
 
-    errs = ((res.get("data") or {}).get("inventorySetQuantities") or {}).get("userErrors") or []
-    if errs:
-        log_error("inventorySetQuantities userErrors (batch)", errs)
 
-    return res
-
-
-def inventory_set_available_zero_batch(endpoint: str, inventory_item_ids: List[str]) -> Dict[str, Any]:
-    return inventory_set_available_batch(
-        endpoint,
-        [(inv_id, 0) for inv_id in inventory_item_ids],
-        reference_document_uri="gid://erp-connector/SyncJob/missing-record",
-    )
+def inventory_errors(res: Dict[str, Any]) -> List[Dict[str, Any]]:
+    payload = ((res.get("data") or {}).get("inventorySetQuantities"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("inventorySetQuantities senza payload: non registro alcun successo")
+    return payload.get("userErrors") or []
 
 
 # =============================================================================
@@ -1258,8 +1277,9 @@ def pick_ids_from_product_node(product: Dict[str, Any], sku: str) -> Tuple[Optio
             chosen = v
             break
 
-    if not chosen and variants:
-        chosen = variants[0]
+    # Mai ripiegare sulla prima variante: potrebbe appartenere a un altro EAN.
+    if not chosen:
+        return product_id, None, None
 
     variant_id = (chosen or {}).get("id")
     inventory_item_id = ((chosen or {}).get("inventoryItem") or {}).get("id")
@@ -1271,17 +1291,20 @@ def pick_ids_from_product_node(product: Dict[str, Any], sku: str) -> Tuple[Optio
 # =============================================================================
 
 class SyncState:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, read_only: bool = False):
         self.path = path
-
-        db_dir = os.path.dirname(os.path.abspath(path))
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-
-        self.conn = sqlite3.connect(path)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
-        self._init_schema()
+        if read_only:
+            # Anche la modalità check lascia invariato il file SQLite.
+            self.conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+            self.conn.execute("PRAGMA query_only=ON;")
+        else:
+            db_dir = os.path.dirname(os.path.abspath(path))
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            self.conn = sqlite3.connect(path)
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
+            self._init_schema()
 
     def _init_schema(self) -> None:
         self.conn.execute("""
@@ -1303,6 +1326,24 @@ class SyncState:
         );
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_items_last_seen ON items(last_seen_run);")
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_issues (
+            ean TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            last_attempt_utc TEXT NOT NULL
+        )""")
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS verified_links (
+            ean TEXT PRIMARY KEY,
+            inventory_item_id TEXT NOT NULL,
+            verified_at TEXT NOT NULL
+        )""")
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS missing_zeroed (
+            ean TEXT PRIMARY KEY,
+            inventory_item_id TEXT NOT NULL,
+            zeroed_at TEXT NOT NULL
+        )""")
         self.conn.commit()
 
     def start_run(self) -> int:
@@ -1358,6 +1399,103 @@ class SyncState:
         self.conn.commit()
 
 
+    def backup_once_for_upgrade(self) -> None:
+        """Copia consistente fatta con SQLite backup API alla prima esecuzione v2."""
+        marker = Path(self.path).with_name(".shopify_sync_upgrade_v2_backup_done")
+        if marker.exists():
+            return
+        target = Path(self.path).with_name(
+            "shopify_sync_state_pre_v2_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite"
+        )
+        dest = sqlite3.connect(str(target))
+        try:
+            self.conn.backup(dest)
+        finally:
+            dest.close()
+        marker.write_text(str(target), encoding="utf-8")
+        logger.info(f"Backup iniziale dello stato SQLite: {target}")
+
+    def link_verified_recently(self, ean: str, inventory_item_id: Optional[str]) -> bool:
+        if not inventory_item_id:
+            return False
+        row = self.conn.execute(
+            "SELECT inventory_item_id, verified_at FROM verified_links WHERE ean=?", (ean,)
+        ).fetchone()
+        if not row or row[0] != inventory_item_id:
+            return False
+        try:
+            ts = datetime.datetime.fromisoformat(row[1])
+            return (datetime.datetime.now(datetime.UTC) - ts).total_seconds() <= max(0, VERIFY_LINK_TTL_DAYS) * 86400
+        except (ValueError, TypeError):
+            return False
+
+    def mark_link_verified(self, ean: str, inventory_item_id: str) -> None:
+        self.conn.execute("""
+          INSERT INTO verified_links(ean, inventory_item_id, verified_at) VALUES (?,?,?)
+          ON CONFLICT(ean) DO UPDATE SET
+            inventory_item_id=excluded.inventory_item_id, verified_at=excluded.verified_at
+        """, (ean, inventory_item_id, datetime.datetime.now(datetime.UTC).isoformat()))
+        self.conn.commit()
+
+    def issue_due(self, ean: str) -> bool:
+        minutes = max(0, REPAIR_COOLDOWN_MINUTES)
+        if minutes == 0:
+            return True
+        row = self.conn.execute(
+            "SELECT last_attempt_utc FROM sync_issues WHERE ean=?", (ean,)
+        ).fetchone()
+        if not row:
+            return True
+        try:
+            date = datetime.datetime.fromisoformat(row[0])
+            now = datetime.datetime.now(datetime.UTC)
+            return (now - date).total_seconds() >= minutes * 60
+        except (TypeError, ValueError):
+            return True
+
+    def record_issue(self, ean: str, reason: str) -> None:
+        now = datetime.datetime.now(datetime.UTC).isoformat()
+        self.conn.execute("""
+          INSERT INTO sync_issues(ean, reason, last_attempt_utc)
+          VALUES (?, ?, ?)
+          ON CONFLICT(ean) DO UPDATE SET
+            reason=excluded.reason, last_attempt_utc=excluded.last_attempt_utc
+        """, (ean, reason[:500], now))
+        self.conn.commit()
+
+    def clear_issue(self, ean: str) -> None:
+        self.conn.execute("DELETE FROM sync_issues WHERE ean=?", (ean,))
+        self.conn.commit()
+
+    def detach_stale_missing_link(self, ean: str, old_inventory_id: str) -> bool:
+        """Rimuove SOLO il collegamento locale vecchio e duplicato, non Shopify.
+
+        Da chiamare dopo conferma positiva che lo stesso ID appartiene a un
+        altro EAN ancora presente nel gestionale.
+        """
+        cur = self.conn.execute("""
+          UPDATE items SET product_id=NULL, variant_id=NULL, inventory_item_id=NULL
+          WHERE ean=? AND inventory_item_id=?
+        """, (ean, old_inventory_id))
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def was_zeroed(self, ean: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM missing_zeroed WHERE ean=?", (ean,)).fetchone() is not None
+
+    def mark_zeroed(self, ean: str, inventory_item_id: str) -> None:
+        self.conn.execute("""
+          INSERT INTO missing_zeroed(ean,inventory_item_id,zeroed_at) VALUES(?,?,?)
+          ON CONFLICT(ean) DO UPDATE SET
+            inventory_item_id=excluded.inventory_item_id,zeroed_at=excluded.zeroed_at
+        """, (ean, inventory_item_id, datetime.datetime.now(datetime.UTC).isoformat()))
+        self.conn.commit()
+
+    def clear_zeroed_for_present(self, eans: Iterable[str]) -> None:
+        self.conn.executemany("DELETE FROM missing_zeroed WHERE ean=?", ((e,) for e in eans))
+        self.conn.commit()
+
+
 # =============================================================================
 # Lettura testi + categoria
 # =============================================================================
@@ -1387,10 +1525,10 @@ def read_testi_records() -> List[Dict[str, Any]]:
         raw_ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
 
         if " " in raw_ean:
-            log_error("Record scartato: CODICE_EAN contiene spazi", {
-                "raw_ean": raw_ean,
-                "titolo": get_ci(row, "TITOLO", default=""),
-            })
+            logger.warning(
+                "Record DBF ignorato: CODICE_EAN contiene spazi | EAN=%r | Titolo=%r",
+                raw_ean, get_ci(row, "TITOLO", default="")
+            )
             continue
 
         ean = raw_ean.strip()
@@ -1464,389 +1602,547 @@ def is_running_as_exe() -> bool:
 
 
 # =============================================================================
-# Main sync
+# Riconciliazione sicura SKU/EAN <-> variante Shopify
 # =============================================================================
 
+QUERY_VARIANTS_BY_SKU = """
+query VariantsBySku($search: String!, $after: String) {
+  productVariants(first: 50, after: $after, query: $search) {
+    nodes { id sku product { id } inventoryItem { id tracked } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+""".strip()
+
+
+class AmbiguousSkuMatch(RuntimeError):
+    pass
+
+
+def find_variant_by_exact_sku(endpoint: str, ean: str) -> Optional[Dict[str, Any]]:
+    """Cerca su Shopify per SKU, usa SOLO corrispondenze esatte e univoche.
+
+    Se non c'e' un solo risultato certo, non modifica giacenze ne' ID locali.
+    """
+    safe_sku = ean.replace('\\', '\\\\').replace('"', '\\"')
+    search = f'sku:"{safe_sku}"'
+    after = None
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for _ in range(5):  # massimo 250 varianti; oltre e' un caso ambiguo
+        data = shopify_graphql(
+            endpoint, SHOPIFY_ACCESS_TOKEN,
+            QUERY_VARIANTS_BY_SKU, {"search": search, "after": after}
+        )
+        conn = (data.get("data") or {}).get("productVariants")
+        if not isinstance(conn, dict):
+            raise RuntimeError(f"Risposta productVariants non valida per EAN {ean}")
+        for variant in conn.get("nodes") or []:
+            if str(variant.get("sku") or "").strip() != ean:
+                continue
+            variant_id = variant.get("id")
+            inv = variant.get("inventoryItem") or {}
+            prod = variant.get("product") or {}
+            if variant_id:
+                candidates[variant_id] = {
+                    "ean": ean,
+                    "product_id": prod.get("id"),
+                    "variant_id": variant_id,
+                    "inventory_item_id": inv.get("id"),
+                    "tracked": inv.get("tracked", False)
+                }
+        pg = conn.get("pageInfo") or {}
+        if not pg.get("hasNextPage"):
+            break
+        after = pg.get("endCursor")
+        if not after:
+            raise RuntimeError("Risposta productVariants senza endCursor")
+    else:
+        raise AmbiguousSkuMatch(f"EAN {ean}: ricerca Shopify troppo ampia (>250 risultati)")
+
+    if len(candidates) > 1:
+        raise AmbiguousSkuMatch(
+            f"EAN {ean}: {len(candidates)} varianti Shopify con lo stesso SKU, intervento manuale necessario"
+        )
+    return next(iter(candidates.values()), None)
+
+
+def shared_inventory_ids(prev: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
+    by_id: Dict[str, List[str]] = {}
+    for ean, row in prev.items():
+        inv_id = row.get("inventory_item_id")
+        if inv_id:
+            by_id.setdefault(inv_id, []).append(ean)
+    return {inv: eans for inv, eans in by_id.items() if len(eans) > 1}
+
+
+def prepare_inventory_row(item: Dict[str, Any], found: Dict[str, Any]) -> Dict[str, Any]:
+    if not found.get("inventory_item_id") or not found.get("tracked"):
+        raise ValueError(f"EAN {item['ean']}: variante senza inventario monitorato; nessuna scrittura")
+    return {
+        **item,
+        "product_id": found["product_id"],
+        "variant_id": found["variant_id"],
+        "inventory_item_id": found["inventory_item_id"],
+        "repaired": bool(item.get("inventory_item_id") and item["inventory_item_id"] != found["inventory_item_id"]),
+        "verified": True,
+        "needs_verification": False
+    }
+
+
+def save_success(state: SyncState, run_id: int, batch: List[Dict[str, Any]]) -> None:
+    state.upsert_items_many([
+        (run_id, i["ean"], i["row_hash"], i.get("product_id"),
+         i.get("variant_id"), i.get("inventory_item_id")) for i in batch
+    ])
+    for i in batch:
+        if i.get("verified") and i.get("inventory_item_id"):
+            state.mark_link_verified(i["ean"], i["inventory_item_id"])
+        state.clear_issue(i["ean"])
+
+
+def inventory_batch_update_resilient(
+    endpoint: str, state: SyncState, run_id: int,
+    batch: List[Dict[str, Any]], stats: Dict[str, int], *, stage: str = "inventory"
+) -> None:
+    """Divide i batch problematici, isola e riconcilia l'item errato per SKU."""
+    if not batch:
+        return
+
+    def send(items: List[Dict[str, Any]], *, repair_allowed: bool = True) -> None:
+        if not items:
+            return
+        keys = [i["inventory_item_id"] for i in items]
+        if len(keys) != len(set(keys)):
+            if len(items) > 1:
+                mid = len(items) // 2
+                send(items[:mid], repair_allowed=repair_allowed)
+                send(items[mid:], repair_allowed=repair_allowed)
+                return
+            raise RuntimeError("InventoryItem ID duplicato impossibile da isolare")
+
+        reference = f"gid://erp-connector/SyncJob/run-{run_id}-{stage}"
+        res = inventory_set_available_batch(
+            endpoint, [(i["inventory_item_id"], i["quantity"]) for i in items],
+            reference_document_uri=reference
+        )
+        errors = inventory_errors(res)
+        if not errors:
+            save_success(state, run_id, items)
+            stats["updated"] += len(items)
+            stats["repaired"] += sum(1 for i in items if i.get("repaired"))
+            return
+
+        # Errori globali (permessi, sede, payload) non si risolvono spezzando.
+        per_item = all(
+            len(e.get("field") or []) >= 4 and
+            (e.get("field") or [])[1] == "quantities" and
+            str((e.get("field") or [])[2]).isdigit()
+            for e in errors
+        )
+        if not per_item:
+            raise RuntimeError(f"Errore inventario generale: {json.dumps(errors, ensure_ascii=False)}")
+        if len(items) > 1:
+            # API puo' avere applicato righe valide: il SET assoluto e' ripetibile.
+            mid = len(items) // 2
+            send(items[:mid], repair_allowed=repair_allowed)
+            send(items[mid:], repair_allowed=repair_allowed)
+            return
+
+        item = items[0]
+        ean = item["ean"]
+        codes = {str(e.get("code") or "") for e in errors}
+        if "INVALID_INVENTORY_ITEM" in codes and repair_allowed:
+            logger.warning("EAN %s: InventoryItem ID rifiutato, cerco SKU esatto su Shopify", ean)
+            try:
+                resolved = find_variant_by_exact_sku(endpoint, ean)
+                if resolved is None:
+                    raise LookupError("Nessuna variante Shopify con SKU esatto")
+                candidate = prepare_inventory_row(item, resolved)
+                if candidate["inventory_item_id"] == item["inventory_item_id"]:
+                    raise RuntimeError("Shopify restituisce ancora lo stesso InventoryItem ID rifiutato")
+                # Mai usare per questo SKU un ID che appartiene a un altro
+                # SKU in una lista gia' pronta: si evitano sovrascritture.
+                logger.info("EAN %s: riparazione ID %s -> %s", ean,
+                            item["inventory_item_id"], candidate["inventory_item_id"])
+                send([candidate], repair_allowed=False)
+                return
+            except (LookupError, ValueError, AmbiguousSkuMatch) as exc:
+                reason = str(exc)
+            # Gli errori API non vengono nascosti: sono fatali per il run.
+            except ShopifyGraphQLApplicationError:
+                raise
+            except requests.RequestException:
+                raise
+            except Exception as exc:
+                reason = str(exc)
+        else:
+            reason = json.dumps(errors, ensure_ascii=False)
+
+        log_error(f"EAN {ean} NON aggiornato: {reason}", {
+            "ean": ean, "quantity": item.get("quantity"),
+            "inventory_item_id": item.get("inventory_item_id"), "codes": list(codes)
+        })
+        state.record_issue(ean, reason)
+        stats["failed"] += 1
+
+    send(batch)
+
+
 def main() -> None:
-    logger.info("=== AVVIO SYNC SHOPIFY ===")
-    logger.info(f"APP_DIR:    {SCRIPT_DIR}")
-    logger.info(f"Config env: {file_path_str(ENV_PATH)}")
-    logger.info(f"Log file:   {LOG_PATH}")
-    logger.info(f"State DB:   {STATE_DB_PATH}")
-    logger.info(f"WordPress cover enabled: {WORDPRESS_COVER_ENABLED}")
-    logger.info(f"WordPress media URL: {WORDPRESS_MEDIA_SEARCH_URL}")
+    logger.info("=== AVVIO SYNC SHOPIFY - VERSIONE SICURA V2 ===")
+    logger.info(f"APP_DIR: {SCRIPT_DIR} | config: {ENV_PATH}")
+    logger.info(f"State DB: {STATE_DB_PATH} | log: {LOG_PATH}")
+    logger.info("WordPress cover: %s | azzera EAN scomparsi: %s | DRY_RUN: %s",
+                WORDPRESS_COVER_ENABLED, ZERO_MISSING_PRODUCTS, DRY_RUN)
 
     records = read_testi_records()
-    logger.info(f"Record letti con EAN: {len(records)}")
+    logger.info("Record validi letti dal DBF: %s", len(records))
+    current_rows = {clean_str(get_ci(r, "CODICE_EAN", default="")): r for r in records}
+    if len(current_rows) != len(records):
+        logger.warning("EAN duplicati nel DBF: %s; prevale l'ultima occorrenza",
+                       len(records) - len(current_rows))
 
-    state = SyncState(STATE_DB_PATH)
-    run_id = state.start_run()
-    prev = state.load_all()
-
-    # -------------------------------------------------------------------------
-    # WordPress viene letto una sola volta e solo se ci sono prodotti nuovi.
-    # Questo evita una chiamata HTTP per ogni prodotto e mantiene il sync veloce
-    # anche con migliaia di record.
-    # -------------------------------------------------------------------------
-    new_eans_preview: set[str] = set()
-    for row in records:
-        ean_preview = clean_str(get_ci(row, "CODICE_EAN", default=""))
-        if ean_preview and ean_preview not in prev:
-            new_eans_preview.add(ean_preview)
-
-    wordpress_cover_by_ean: Dict[str, str] = {}
-
-    if WORDPRESS_COVER_ENABLED and new_eans_preview:
-        wordpress_cover_by_ean = load_wordpress_cover_urls_by_ean()
-
-        wp_hits_for_new = sum(
-            1 for ean in new_eans_preview
-            if ean in wordpress_cover_by_ean
-        )
-
-        logger.info(
-            f"Nuovi prodotti rilevati: {len(new_eans_preview)} | "
-            f"immagini WordPress disponibili per nuovi prodotti: {wp_hits_for_new} | "
-            f"fallback template: {len(new_eans_preview) - wp_hits_for_new}"
-        )
-    elif not new_eans_preview:
-        logger.info("Nessun nuovo prodotto: non indicizzo immagini WordPress")
-    else:
-        logger.info("WordPress cover disabilitate: uso COVER_URL_TEMPLATE per eventuali nuovi prodotti")
-
-    if DRY_RUN:
-        endpoint = ""
-        logger.info("DRY_RUN=1 (nessuna chiamata a Shopify)")
-    else:
-        if not SHOPIFY_SHOP or not SHOPIFY_ACCESS_TOKEN:
-            raise RuntimeError(
-                "Config mancante: SHOPIFY_SHOP e SHOPIFY_ACCESS_TOKEN (oppure DRY_RUN=1)."
-            )
-        if not SHOPIFY_LOCATION_ID:
-            raise RuntimeError("Config mancante: SHOPIFY_LOCATION_ID.")
-
-        endpoint = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
-
-    seen_now: set[str] = set()
-    created = 0
-    updated = 0
-    unchanged = 0
-    zeroed = 0
-
-    to_create: List[Dict[str, Any]] = []
-    to_inventory_update: List[Dict[str, Any]] = []
-    unchanged_rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]] = []
-
-    for row in records:
-        ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
-        if not ean:
-            continue
-
-        seen_now.add(ean)
-
-        h = compute_row_hash(row)
-        prev_item = prev.get(ean)
-        is_scolastico_row = is_scolastico(row)
-
-        is_new = prev_item is None
-        is_changed = (not is_new) and (prev_item.get("row_hash") != h)
-
-        if (not is_new) and (is_scolastico_row or not is_changed):
-            unchanged += 1
-            unchanged_rows.append((
-                run_id,
-                ean,
-                h,
-                prev_item.get("product_id"),
-                prev_item.get("variant_id"),
-                prev_item.get("inventory_item_id")
-            ))
-        elif is_new:
-            to_create.append({
-                "ean": ean,
-                "row_hash": h,
-                # I prodotti nuovi vengono creati con scheda completa.
-                # Per i nuovi prodotti: prima immagine WordPress, poi fallback template.
-                "input": build_productset_input_from_testi_row(
-                    row,
-                    include_files=True,
-                    wordpress_cover_by_ean=wordpress_cover_by_ean,
-                ),
-                "is_new": True,
-            })
-        else:
-            # Prodotto già creato: da questo punto in poi NON aggiorniamo più
-            # titolo, descrizione, prezzo, autore, categoria, note, metafield
-            # o immagini. Se cambia qualcosa nel DBF, lo state considera solo
-            # la giacenza e su Shopify inviamo solo inventorySetQuantities.
-            to_inventory_update.append({
-                "ean": ean,
-                "row_hash": h,
-                "quantity": get_row_stock_quantity(row),
-                "product_id": prev_item.get("product_id"),
-                "variant_id": prev_item.get("variant_id"),
-                "inventory_item_id": prev_item.get("inventory_item_id"),
-            })
-
+    state = SyncState(STATE_DB_PATH, read_only=DRY_RUN)
     try:
-        for chunk in chunked(unchanged_rows, SQLITE_UPSERT_BATCH):
-            state.upsert_items_many(chunk)
+        prev = state.load_all()
+        dup = shared_inventory_ids(prev)
+        for inv_id, eans in dup.items():
+            logger.warning("ID inventario DUPLICATO nello stato: %s -> %s", inv_id, eans)
+
+        newly_seen = [ean for ean in current_rows if ean not in prev]
+        changed = []
+        unchanged_rows = []
+        dup_eans = {ean for group in dup.values() for ean in group}
+        for ean, row in current_rows.items():
+            old = prev.get(ean)
+            if old is None:
+                continue
+            h = compute_row_hash(row)
+            # I duplicati devono essere verificati anche se la scorta non varia.
+            if not is_scolastico(row) and (old["row_hash"] != h or ean in dup_eans):
+                changed.append({
+                    "ean": ean, "row_hash": h, "quantity": get_row_stock_quantity(row),
+                    "product_id": old.get("product_id"),
+                    "variant_id": old.get("variant_id"),
+                    "inventory_item_id": old.get("inventory_item_id"),
+                    "needs_verification": ean in dup_eans
+                })
+            else:
+                unchanged_rows.append((ean, h, old))
+
+        missing = [ean for ean in prev if ean not in current_rows]
+        logger.info("Nuovi rispetto a SQLite: %d | giacenze da aggiornare/verificare: %d | "
+                    "invariati: %d | EAN scomparsi: %d", len(newly_seen), len(changed),
+                    len(unchanged_rows), len(missing))
 
         if DRY_RUN:
-            sim_create = [(run_id, it["ean"], it["row_hash"], None, None, None) for it in to_create]
-            sim_inventory = [
-                (run_id, it["ean"], it["row_hash"], it.get("product_id"), it.get("variant_id"), it.get("inventory_item_id"))
-                for it in to_inventory_update
-            ]
-            for chunk in chunked(sim_create + sim_inventory, SQLITE_UPSERT_BATCH):
-                state.upsert_items_many(chunk)
-        else:
-            if not BULK_ENABLED:
-                raise RuntimeError("BULK_ENABLED=0 ma bulk richiesto: imposta BULK_ENABLED=1")
+            logger.info("CHECK SOLA LETTURA: non contatto Shopify, non modifico SQLite.")
+            for item in changed[:25]:
+                logger.info("DA AGGIORNARE: EAN=%s qta=%s item=%s", item["ean"],
+                            item["quantity"], item.get("inventory_item_id"))
+            logger.info("=== CHECK COMPLETATO ===")
+            return
 
-            # -----------------------------------------------------------------
-            # 1) CREAZIONE prodotti nuovi: productSet completo.
-            #    Nessun prodotto già esistente passa più da productSet.
-            # -----------------------------------------------------------------
+        if not SHOPIFY_SHOP or not SHOPIFY_ACCESS_TOKEN or not SHOPIFY_LOCATION_ID:
+            raise RuntimeError("config.env: SHOPIFY_SHOP, SHOPIFY_ACCESS_TOKEN e SHOPIFY_LOCATION_ID obbligatori")
+        if not BULK_ENABLED:
+            raise RuntimeError("BULK_ENABLED=0: questa versione richiede BULK_ENABLED=1")
+        if len(newly_seen) > max(0, MAX_NEW_PRODUCTS_PER_RUN):
+            raise RuntimeError(
+                f"Bloccata creazione: {len(newly_seen)} EAN sconosciuti a SQLite "
+                f"(soglia {MAX_NEW_PRODUCTS_PER_RUN}). Controlla se e' il DB di stato corretto."
+            )
+
+        endpoint = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+        state.backup_once_for_upgrade()
+        run_id = state.start_run()
+        stats = {"created": 0, "updated": 0, "repaired": 0,
+                 "unchanged": len(unchanged_rows), "zeroed": 0,
+                 "failed": 0, "deferred": 0, "skipped_zero": 0}
+        try:
+            # Lo stato degli invariati puo' avanzare; quelli falliti non vengono
+            # mai contrassegnati come sincronizzati.
+            state.clear_zeroed_for_present(current_rows.keys())
+            for part in chunked(unchanged_rows, SQLITE_UPSERT_BATCH):
+                state.upsert_items_many([
+                    (run_id, ean, h, o.get("product_id"), o.get("variant_id"), o.get("inventory_item_id"))
+                    for ean, h, o in part
+                ])
+
+            # Non creiamo un EAN gia' esistente su Shopify: lo riagganciamo allo stato.
+            truly_new = []
+            for ean in newly_seen:
+                row = current_rows[ean]
+                h = compute_row_hash(row)
+                try:
+                    found = find_variant_by_exact_sku(endpoint, ean)
+                    if found:
+                        if is_scolastico(row):
+                            state.upsert_items_many([(
+                                run_id, ean, h, found["product_id"],
+                                found["variant_id"], found["inventory_item_id"]
+                            )])
+                            logger.info("EAN scolastico %s: collegato a prodotto Shopify gia' esistente", ean)
+                        else:
+                            changed.append(prepare_inventory_row({
+                                "ean": ean, "row_hash": h,
+                                "quantity": get_row_stock_quantity(row)
+                            }, found))
+                            logger.info("EAN %s: presente su Shopify, collego senza ricrearlo", ean)
+                    else:
+                        truly_new.append({"ean": ean, "row_hash": h, "row": row})
+                except (AmbiguousSkuMatch, ValueError) as exc:
+                    logger.error("EAN %s non creato/collegato: %s", ean, exc)
+                    state.record_issue(ean, str(exc))
+                    stats["failed"] += 1
+
+            # Solo i nuovi veri richiedono l'indicizzazione delle immagini.
+            covers = {}
+            if truly_new and WORDPRESS_COVER_ENABLED:
+                covers = load_wordpress_cover_urls_by_ean()
+
             publish_queue: List[str] = []
-            logger.info(f"Bulk productSet nuovi prodotti: {len(to_create)} (chunk={BULK_CHUNK_SIZE})")
-            total_chunks = (len(to_create) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE if to_create else 0
-
-            for chunk_idx, chunk_items in enumerate(chunked(to_create, BULK_CHUNK_SIZE), start=1):
-                t_chunk0 = time.perf_counter()
-                chunk_log("productSet", chunk_idx, total_chunks, "inizio elaborazione")
-
-                eans_in_order: List[str] = []
-                rowhash_by_ean: Dict[str, str] = {}
-                isnew_by_ean: Dict[str, bool] = {}
-                lines: List[str] = []
-
-                for it in chunk_items:
-                    ean = it["ean"]
-                    eans_in_order.append(ean)
-                    rowhash_by_ean[ean] = it["row_hash"]
-                    isnew_by_ean[ean] = bool(it["is_new"])
-
-                    input_obj = dict(it["input"])
-
-                    lines.append(json.dumps({
-                        "identifier": {
-                            "customId": {
-                                "namespace": EXTERNAL_ID_NAMESPACE,
-                                "key": EXTERNAL_ID_KEY,
-                                "value": ean
-                            }
-                        },
-                        "input": input_obj
+            logger.info("Nuovi veri da creare con productSet: %d", len(truly_new))
+            total = (len(truly_new) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE
+            for ix, part in enumerate(chunked(truly_new, BULK_CHUNK_SIZE), 1):
+                inputs = []
+                for item in part:
+                    ean = item["ean"]
+                    inputs.append(json.dumps({
+                        "identifier": {"customId": {
+                            "namespace": EXTERNAL_ID_NAMESPACE,
+                            "key": EXTERNAL_ID_KEY, "value": ean
+                        }},
+                        "input": build_productset_input_from_testi_row(
+                            item["row"], include_files=True, wordpress_cover_by_ean=covers
+                        )
                     }, ensure_ascii=False, separators=(",", ":")))
-
-                jsonl_bytes = ("\n".join(lines) + "\n").encode("utf-8")
-
-                staged_path = staged_upload_jsonl(
-                    endpoint,
-                    SHOPIFY_ACCESS_TOKEN,
-                    filename=f"productset_vars_run{run_id}_chunk{chunk_idx}.jsonl",
-                    jsonl_bytes=jsonl_bytes
+                staged = staged_upload_jsonl(
+                    endpoint, SHOPIFY_ACCESS_TOKEN,
+                    filename=f"productset_vars_run{run_id}_chunk{ix}.jsonl",
+                    jsonl_bytes=("\n".join(inputs) + "\n").encode("utf-8")
                 )
-
                 op_id = bulk_run_mutation(
-                    endpoint,
-                    SHOPIFY_ACCESS_TOKEN,
-                    mutation_str=BULK_MUTATION_PRODUCT_SET,
-                    staged_upload_path=staged_path,
-                    client_identifier=f"productset_run{run_id}_chunk{chunk_idx}"
+                    endpoint, SHOPIFY_ACCESS_TOKEN, mutation_str=BULK_MUTATION_PRODUCT_SET,
+                    staged_upload_path=staged, client_identifier=f"productset_run{run_id}_chunk{ix}"
                 )
-
-                logger.info(f"[productSet] Chunk {chunk_idx}/{total_chunks} | bulk avviata: {op_id}")
                 op = poll_bulk_operation(endpoint, SHOPIFY_ACCESS_TOKEN, op_id)
-                status = (op.get("status") or "").upper()
-                if status != "COMPLETED":
-                    log_error("Bulk productSet non COMPLETED", op)
-                    raise RuntimeError("Bulk productSet fallita")
+                if (op.get("status") or "").upper() != "COMPLETED" or not op.get("url"):
+                    raise RuntimeError(f"Bulk productSet non completata: {op}")
 
-                out_url = op.get("url")
-                if not out_url:
-                    log_error("Bulk productSet COMPLETED ma url output mancante", op)
-                    raise RuntimeError("Output url mancante")
-
-                upsert_rows: List[Tuple[int, str, str, Optional[str], Optional[str], Optional[str]]] = []
-
-                logger.info(f"[productSet] Chunk {chunk_idx}/{total_chunks} | scarico risultati bulk")
-                for i, out_line in enumerate(iter_jsonl_from_url(out_url)):
-                    if i >= len(eans_in_order):
-                        break
-
-                    ean = eans_in_order[i]
-                    payload = (out_line.get("data") or {}).get("productSet") or {}
-                    uerrs = payload.get("userErrors") or []
-
-                    if uerrs:
-                        log_error(f"productSet userErrors (EAN={ean})", uerrs)
+                done_lines = set()
+                for output in iter_jsonl_from_url(op["url"]):
+                    num = output.get("__lineNumber")
+                    if not isinstance(num, int) or not 0 <= num < len(part) or num in done_lines:
+                        log_error("Risposta bulk senza __lineNumber valido/univoco: non associo ID", output)
                         continue
-
-                    product = payload.get("product") or {}
-                    if not product:
-                        log_error(f"productSet senza product (EAN={ean})", out_line)
+                    done_lines.add(num)
+                    item = part[num]
+                    ean = item["ean"]
+                    payload = ((output.get("data") or {}).get("productSet") or {})
+                    errors = payload.get("userErrors") or []
+                    if errors:
+                        log_error(f"productSet non riuscito EAN={ean}", errors)
+                        state.record_issue(ean, json.dumps(errors, ensure_ascii=False))
+                        stats["failed"] += 1
                         continue
-
-                    product_id = product.get("id")
-                    if not product_id:
-                        log_error(f"productSet product_id NULL (EAN={ean})", out_line)
+                    prod = payload.get("product") or {}
+                    pid, vid, iid = pick_ids_from_product_node(prod, ean)
+                    if not (pid and vid and iid):
+                        reason = "productSet senza corrispondenza variante SKU esatta / ID valido"
+                        log_error(f"EAN {ean}: {reason}", output)
+                        state.record_issue(ean, reason)
+                        stats["failed"] += 1
                         continue
-
-                    product_id, variant_id, inventory_item_id = pick_ids_from_product_node(product, ean)
-
-                    upsert_rows.append((
-                        run_id,
-                        ean,
-                        rowhash_by_ean[ean],
-                        product_id,
-                        variant_id,
-                        inventory_item_id
-                    ))
-
-                    created += 1
+                    state.upsert_items_many([(run_id, ean, item["row_hash"], pid, vid, iid)])
+                    state.clear_issue(ean)
+                    stats["created"] += 1
                     if PUBLICATION_IDS:
-                        publish_queue.append(product_id)
+                        publish_queue.append(pid)
+                for i, item in enumerate(part):
+                    if i not in done_lines:
+                        state.record_issue(item["ean"], "Risposta assente dall'output bulk")
+                        stats["failed"] += 1
+                        logger.error("EAN %s: risultato bulk mancante", item["ean"])
+                logger.info("[productSet] Chunk %s/%s terminato", ix, total)
 
-                for sub in chunked(upsert_rows, SQLITE_UPSERT_BATCH):
-                    state.upsert_items_many(sub)
-
-                chunk_log(
-                    "productSet",
-                    chunk_idx,
-                    total_chunks,
-                    f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s"
-                )
-
-            # -----------------------------------------------------------------
-            # 2) AGGIORNAMENTO prodotti esistenti: solo giacenza.
-            #    Qui non vengono inviati title, descriptionHtml, vendor, price,
-            #    metafield, tags o files.
-            # -----------------------------------------------------------------
-            logger.info(f"Aggiornamento sole giacenze prodotti esistenti: {len(to_inventory_update)}")
-            inv_updates = [
-                it for it in to_inventory_update
-                if it.get("inventory_item_id")
-            ]
-            missing_inv = [it for it in to_inventory_update if not it.get("inventory_item_id")]
-            for it in missing_inv:
-                log_error(
-                    f"Impossibile aggiornare solo giacenza: inventory_item_id mancante (EAN={it['ean']})",
-                    {"ean": it["ean"], "product_id": it.get("product_id"), "variant_id": it.get("variant_id")}
-                )
-
-            inv_total = (len(inv_updates) + INVENTORY_ZERO_BATCH - 1) // INVENTORY_ZERO_BATCH if inv_updates else 0
-            for chunk_idx, batch in enumerate(chunked(inv_updates, INVENTORY_ZERO_BATCH), start=1):
-                t_chunk0 = time.perf_counter()
-                chunk_log("inventory", chunk_idx, inv_total, "inizio aggiornamento giacenze")
-
-                res = inventory_set_available_batch(
-                    endpoint,
-                    [(it["inventory_item_id"], it["quantity"]) for it in batch],
-                    reference_document_uri=f"gid://erp-connector/SyncJob/run-{run_id}-inventory",
-                )
-                errs = ((res.get("data") or {}).get("inventorySetQuantities") or {}).get("userErrors") or []
-                if errs:
+            # Per ogni ID duplicato cerchiamo prima il vero SKU, mai usarlo
+            # direttamente perche' potrebbe rappresentare un altro articolo.
+            pending = []
+            for item in changed:
+                ean = item["ean"]
+                if not state.issue_due(ean):
+                    stats["deferred"] += 1
                     continue
+                # Alla prima modifica di scorta controlla la relazione SKU -> ID
+                # anche se l'ID e' ancora tecnicamente valido (evita scorte
+                # assegnate al prodotto sbagliato). Cache per 7 giorni.
+                needs_validation = (item.get("needs_verification") or
+                                    not state.link_verified_recently(ean, item.get("inventory_item_id")))
+                if needs_validation:
+                    try:
+                        found = find_variant_by_exact_sku(endpoint, ean)
+                        if not found:
+                            raise LookupError("EAN/SKU esatto non trovato su Shopify")
+                        item = prepare_inventory_row(item, found)
+                        logger.info("EAN %s: variante verificata tramite SKU; ID=%s",
+                                    ean, item["inventory_item_id"])
+                    except (LookupError, ValueError, AmbiguousSkuMatch) as exc:
+                        log_error(f"EAN {ean}: impossibile verificare ID Shopify", str(exc))
+                        state.record_issue(ean, str(exc))
+                        stats["failed"] += 1
+                        continue
+                pending.append(item)
 
-                updated += len(batch)
-                upsert_rows = [
-                    (run_id, it["ean"], it["row_hash"], it.get("product_id"), it.get("variant_id"), it.get("inventory_item_id"))
-                    for it in batch
-                ]
-                for sub in chunked(upsert_rows, SQLITE_UPSERT_BATCH):
-                    state.upsert_items_many(sub)
+            # Conflitti interni al batch: ricerchiamo SKU per entrambi, poi
+            # blocchiamo quelli che ancora condividono l'ID.
+            by_inv: Dict[str, List[Dict[str, Any]]] = {}
+            for item in pending:
+                by_inv.setdefault(item["inventory_item_id"], []).append(item)
+            if any(len(v) > 1 for v in by_inv.values()):
+                for inv_id, records_with_id in list(by_inv.items()):
+                    if len(records_with_id) < 2:
+                        continue
+                    for item in records_with_id:
+                        if item.get("repaired"):
+                            continue
+                        try:
+                            variant = find_variant_by_exact_sku(endpoint, item["ean"])
+                            if not variant:
+                                raise LookupError("SKU non trovato")
+                            candidate = prepare_inventory_row(item, variant)
+                            item.update(candidate)
+                        except (LookupError, ValueError, AmbiguousSkuMatch) as exc:
+                            state.record_issue(item["ean"], str(exc))
+                            item["unsafe"] = True
+                counts: Dict[str, int] = {}
+                for item in pending:
+                    counts[item["inventory_item_id"]] = counts.get(item["inventory_item_id"], 0) + 1
+                safe = []
+                for item in pending:
+                    if item.get("unsafe") or counts[item["inventory_item_id"]] > 1:
+                        logger.error("EAN %s BLOCCATO: ID inventario condiviso/incerto", item["ean"])
+                        state.record_issue(item["ean"], "ID inventario condiviso o incerto")
+                        stats["failed"] += 1
+                    else:
+                        safe.append(item)
+                pending = safe
 
-                chunk_log(
-                    "inventory",
-                    chunk_idx,
-                    inv_total,
-                    f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s"
-                )
+            logger.info("Aggiornamento scorte: %d EAN in %d batch", len(pending),
+                        (len(pending) + INVENTORY_ZERO_BATCH - 1) // INVENTORY_ZERO_BATCH)
+            for ix, part in enumerate(chunked(pending, INVENTORY_ZERO_BATCH), 1):
+                t = time.perf_counter()
+                inventory_batch_update_resilient(endpoint, state, run_id, part, stats)
+                logger.info("[inventory] Batch %d completato in %.2fs", ix, time.perf_counter() - t)
+
+            # Pulisce i vecchi link duplicati per EAN scomparsi SOLO dopo
+            # aver dimostrato che quell'InventoryItem appartiene allo SKU attivo.
+            # Non elimina mai prodotti o varianti da Shopify.
+            for old_inv, group in dup.items():
+                active_eans = [e for e in group if e in current_rows]
+                missing_eans = [e for e in group if e not in current_rows]
+                if len(active_eans) == 1 and missing_eans:
+                    if state.link_verified_recently(active_eans[0], old_inv):
+                        for missing_ean in missing_eans:
+                            if state.detach_stale_missing_link(missing_ean, old_inv):
+                                logger.warning(
+                                    "EAN scomparso %s: rimosso soltanto il collegamento SQLite duplicato; "
+                                    "Shopify non modificato", missing_ean
+                                )
 
             if PUBLICATION_IDS and publish_queue:
-                publish_total = (len(publish_queue) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE
-                logger.info(f"Bulk publish: {len(publish_queue)} (chunk={BULK_CHUNK_SIZE})")
-
-                for chunk_idx, prod_ids in enumerate(chunked(publish_queue, BULK_CHUNK_SIZE), start=1):
-                    t_chunk0 = time.perf_counter()
-                    chunk_log("publish", chunk_idx, publish_total, "inizio elaborazione")
-
-                    lines = []
-                    for pid in prod_ids:
-                        lines.append(json.dumps({
-                            "id": pid,
-                            "input": [{"publicationId": pub_id} for pub_id in PUBLICATION_IDS]
-                        }, ensure_ascii=False, separators=(",", ":")))
-
-                    jsonl_bytes = ("\n".join(lines) + "\n").encode("utf-8")
-
-                    staged_path = staged_upload_jsonl(
-                        endpoint,
-                        SHOPIFY_ACCESS_TOKEN,
-                        filename=f"publish_vars_run{run_id}_chunk{chunk_idx}.jsonl",
-                        jsonl_bytes=jsonl_bytes
+                pub_total = (len(publish_queue) + BULK_CHUNK_SIZE - 1) // BULK_CHUNK_SIZE
+                for ix, pids in enumerate(chunked(publish_queue, BULK_CHUNK_SIZE), 1):
+                    lines = [json.dumps({
+                        "id": pid,
+                        "input": [{"publicationId": pub} for pub in PUBLICATION_IDS]
+                    }, ensure_ascii=False, separators=(",", ":")) for pid in pids]
+                    staged = staged_upload_jsonl(
+                        endpoint, SHOPIFY_ACCESS_TOKEN,
+                        filename=f"publish_vars_run{run_id}_chunk{ix}.jsonl",
+                        jsonl_bytes=("\n".join(lines) + "\n").encode("utf-8")
                     )
-
                     op_id = bulk_run_mutation(
-                        endpoint,
-                        SHOPIFY_ACCESS_TOKEN,
-                        mutation_str=BULK_MUTATION_PUBLISH,
-                        staged_upload_path=staged_path,
-                        client_identifier=f"publish_run{run_id}_chunk{chunk_idx}"
+                        endpoint, SHOPIFY_ACCESS_TOKEN, mutation_str=BULK_MUTATION_PUBLISH,
+                        staged_upload_path=staged, client_identifier=f"publish_run{run_id}_chunk{ix}"
                     )
-
-                    logger.info(f"[publish] Chunk {chunk_idx}/{publish_total} | bulk avviata: {op_id}")
                     op = poll_bulk_operation(endpoint, SHOPIFY_ACCESS_TOKEN, op_id)
-                    status = (op.get("status") or "").upper()
-                    if status != "COMPLETED":
-                        log_error("Bulk publish non COMPLETED", op)
-                        raise RuntimeError("Bulk publish fallita")
+                    if (op.get("status") or "").upper() != "COMPLETED" or not op.get("url"):
+                        raise RuntimeError(f"Bulk publish non completata: {op}")
+                    for output in iter_jsonl_from_url(op["url"]):
+                        errors = (((output.get("data") or {}).get("publishablePublish") or {})
+                                  .get("userErrors") or [])
+                        if errors:
+                            log_error("publishablePublish userErrors", errors)
+                            stats["failed"] += 1
+                    logger.info("[publish] Chunk %d/%d terminato", ix, pub_total)
 
-                    out_url = op.get("url")
-                    if out_url:
-                        logger.info(f"[publish] Chunk {chunk_idx}/{publish_total} | scarico risultati bulk")
-                        for out_line in iter_jsonl_from_url(out_url):
-                            uerrs = ((out_line.get("data") or {}).get("publishablePublish") or {}).get("userErrors") or []
-                            if uerrs:
-                                log_error("publishablePublish userErrors", uerrs)
+            # Evitiamo azzeramenti pericolosi al primo deploy. Se l'utente
+            # li riabilita, ogni SKU deve essere unico e verificato su Shopify.
+            if missing and not ZERO_MISSING_PRODUCTS:
+                stats["skipped_zero"] = len(missing)
+                logger.warning("Azzeramento di %d EAN scomparsi DISABILITATO per sicurezza. "
+                               "Per abilitarlo: ZERO_MISSING_PRODUCTS=1 in config.env", len(missing))
+            if missing and ZERO_MISSING_PRODUCTS:
+                ids_owned_by_active = {
+                    r.get("inventory_item_id") for ean, r in state.load_all().items()
+                    if ean in current_rows and r.get("inventory_item_id")
+                }
+                for ean in missing:
+                    if state.was_zeroed(ean):
+                        continue
+                    old = prev[ean]
+                    # Nessun azzeramento se un vecchio ID compare anche altrove.
+                    if old.get("inventory_item_id") in dup:
+                        stats["skipped_zero"] += 1
+                        logger.warning("EAN scomparso %s: ID condiviso, azzeramento BLOCCATO", ean)
+                        continue
+                    if not state.issue_due(ean):
+                        stats["deferred"] += 1
+                        continue
+                    try:
+                        found = find_variant_by_exact_sku(endpoint, ean)
+                        if not found:
+                            # Non esiste SKU Shopify da azzerare; registriamo la
+                            # condizione, non tocchiamo altri SKU.
+                            state.record_issue(ean, "SKU assente da Shopify")
+                            stats["skipped_zero"] += 1
+                            continue
+                        inv = found["inventory_item_id"]
+                        if not inv or not found.get("tracked") or inv in ids_owned_by_active:
+                            raise ValueError("InventoryItem senza tracking o condiviso con EAN attivo")
+                        zero = inventory_set_available_batch(
+                            endpoint, [(inv, 0)],
+                            reference_document_uri=f"gid://erp-connector/SyncJob/run-{run_id}-missing"
+                        )
+                        errs = inventory_errors(zero)
+                        if errs:
+                            raise ValueError(json.dumps(errs, ensure_ascii=False))
+                        state.mark_zeroed(ean, inv)
+                        state.clear_issue(ean)
+                        stats["zeroed"] += 1
+                    except (ValueError, AmbiguousSkuMatch) as exc:
+                        log_error(f"EAN scomparso {ean}: azzeramento NON eseguito", str(exc))
+                        state.record_issue(ean, str(exc))
+                        stats["failed"] += 1
 
-                    chunk_log(
-                        "publish",
-                        chunk_idx,
-                        publish_total,
-                        f"COMPLETED in {time.perf_counter() - t_chunk0:.2f}s"
-                    )
-
-        missing = [ean for ean in prev.keys() if ean not in seen_now]
-        if missing and (not DRY_RUN):
-            inv_pairs: List[Tuple[str, str]] = []
-            for ean in missing:
-                inv_id = (prev.get(ean) or {}).get("inventory_item_id")
-                if inv_id:
-                    inv_pairs.append((ean, inv_id))
-
-            for batch in chunked(inv_pairs, INVENTORY_ZERO_BATCH):
-                batch_inv = [inv for (_, inv) in batch]
-                res = inventory_set_available_zero_batch(endpoint, batch_inv)
-                errs = ((res.get("data") or {}).get("inventorySetQuantities") or {}).get("userErrors") or []
-                if not errs:
-                    zeroed += len(batch)
-
-    except Exception:
-        logger.exception("ERRORE FATALE durante sync")
-        raise
+        except Exception:
+            logger.exception("ERRORE FATALE durante sincronizzazione")
+            raise
+        finally:
+            state.finish_run(run_id)
+            logger.info("=== RIEPILOGO RUN %s ===", run_id)
+            for k, v in stats.items():
+                logger.info("%-15s %d", k, v)
+            logger.info("State DB: %s | log: %s", STATE_DB_PATH, LOG_PATH)
+        if stats["failed"] or stats["deferred"]:
+            logger.warning("=== SYNC PARZIALE: %d falliti, %d rinviati ===",
+                           stats["failed"], stats["deferred"])
+            # EXIT NON ZERO: Task Scheduler puo' notificare/sorvegliare il guasto.
+            raise RuntimeError("Sincronizzazione incompleta: consultare shopify_sync.log")
+        logger.info("=== SYNC COMPLETATA SENZA ERRORI ===")
     finally:
-        state.finish_run(run_id)
-
-    logger.info("=== SYNC COMPLETATA ===")
-    logger.info(f"Creati:     {created}")
-    logger.info(f"Aggiornati: {updated}")
-    logger.info(f"Invariati:  {unchanged}")
-    logger.info(f"Spariti->0: {zeroed}")
-    logger.info(f"State DB:   {STATE_DB_PATH}")
-    logger.info(f"Log file:   {LOG_PATH}")
+        state.conn.close()
 
 
 def try_acquire_single_instance_lock():
