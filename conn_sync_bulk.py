@@ -9,6 +9,7 @@
 from dotenv import load_dotenv
 from pathlib import Path
 import sys
+import argparse
 import os
 import re
 import html
@@ -544,6 +545,10 @@ def shopify_graphql(
 MUTATION_INVENTORY_SET_QUANTITIES = """
 mutation InventorySet($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
   inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+    inventoryAdjustmentGroup {
+      reason
+      changes { name delta }
+    }
     userErrors { field message code }
   }
 }
@@ -1191,19 +1196,17 @@ def build_productset_input_from_testi_row(
     if sconto_percentuale > 0 and prezzo_finale < prezzo:
         variant_obj["compareAtPrice"] = money_str(prezzo)
 
+    # TUTTE le categorie (incluso SCOLASTICO) devono avere scorte monitorate.
+    # Solo SCOLASTICO rimane vendibile con disponibilità pari o inferiore a zero.
     if is_scolastico(row):
-        # Prodotti SCOLASTICO: scorte non monitorate e prodotto sempre acquistabile.
-        # - tracked=False disattiva il tracking inventario sull'inventory item.
-        # - inventoryPolicy=CONTINUE consente l'acquisto anche senza disponibilità.
-        # - non inviamo inventoryQuantities perché la scorta non deve essere gestita.
-        variant_obj["inventoryItem"] = {"tracked": False}
+        variant_obj["inventoryItem"] = {"tracked": True}
         variant_obj["inventoryPolicy"] = "CONTINUE"
-    else:
-        variant_obj["inventoryQuantities"] = [{
-            "locationId": SHOPIFY_LOCATION_ID,
-            "name": "available",
-            "quantity": int(giacenza),
-        }]
+
+    variant_obj["inventoryQuantities"] = [{
+        "locationId": SHOPIFY_LOCATION_ID,
+        "name": "available",
+        "quantity": int(giacenza),
+    }]
 
     input_obj: Dict[str, Any] = {
         "title": titolo or f"Libro {ean}",
@@ -1249,16 +1252,17 @@ def is_scolastico(row: Dict[str, Any]) -> bool:
 
 
 def compute_row_hash(row: Dict[str, Any]) -> str:
-    # Per i prodotti già esistenti il monitoraggio del cambiamento deve
-    # dipendere solo dalla giacenza. Titolo, descrizione, prezzo, autore,
-    # categoria, note, immagini e metafield non devono più causare update
-    # del prodotto su Shopify.
+    # Lo stato cambia quando cambia la giacenza, anche per SCOLASTICO.
+    # Il marcatore speciale è presente SOLO per SCOLASTICO: forza la
+    # risincronizzazione rispetto all'hash della versione precedente senza
+    # riscrivere le giacenze di tutto il resto del catalogo al deploy.
+    # Le altre informazioni prodotto non generano aggiornamenti come in V2.
     payload = {
         "ean": clean_str(get_ci(row, "CODICE_EAN", default="")),
-        # Per SCOLASTICO la scorta non è monitorata su Shopify, quindi la
-        # giacenza del DBF non deve generare update futuri.
-        "giacenza": None if is_scolastico(row) else get_row_stock_quantity(row),
+        "giacenza": get_row_stock_quantity(row),
     }
+    if is_scolastico(row):
+        payload["scolastico"] = True
     s = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -1558,6 +1562,122 @@ def read_testi_records() -> List[Dict[str, Any]]:
 
 
 # =============================================================================
+# Diagnostica EAN DBF: nessuna chiamata Shopify e nessuna scrittura SQLite
+# =============================================================================
+
+def diagnose_ean_dbf(ean: str) -> str:
+    """Spiega perché --migrate-scolastico non seleziona un EAN.
+
+    Esegue una scansione DIRETTA di testi.dbf, senza applicare il filtro
+    SCOLASTICO né il filtro sugli EAN contenenti spazi, e controlla
+    separatamente la corrispondenza con tipologie.dbf. Non legge/scrive Shopify.
+    """
+    ean = (ean or "").strip()
+    if not ean:
+        raise ValueError("EAN vuoto")
+    lines = [
+        f"=== DIAGNOSTICA DBF EAN {ean} (sola lettura) ===",
+        f"File testi: {DBF_PATH}",
+        f"File tipologie: {TIPOLOGIE_DBF_PATH}",
+    ]
+    if not os.path.isfile(DBF_PATH):
+        return "\n".join(lines + ["ERRORE: file testi.dbf non trovato nel percorso indicato."])
+    if not os.path.isfile(TIPOLOGIE_DBF_PATH):
+        return "\n".join(lines + ["ERRORE: file tipologie.dbf non trovato nel percorso indicato."])
+
+    tipi = load_tipologie_map(TIPOLOGIE_DBF_PATH)
+    dbf = _read_all_bytes(DBF_PATH)
+    fields, header_len, record_len, num_records = parse_dbf_fields(dbf)
+    offsets = build_field_offsets(fields)
+    ean_field = next((x for x in offsets if x[0].upper() == "CODICE_EAN"), None)
+    if not ean_field:
+        return "\n".join(lines + [
+            "ERRORE: il campo CODICE_EAN non esiste in testi.dbf.",
+            "Campi trovati: " + ", ".join(name for name, *_ in fields),
+        ])
+    _, ean_ftype, ean_length, _, ean_offset = ean_field
+    if ean_ftype not in ("C", "N"):
+        return "\n".join(lines + [
+            f"ERRORE: tipo inatteso per CODICE_EAN: {ean_ftype}.",
+        ])
+    lines.append(f"Record dichiarati in testi.dbf: {num_records}")
+    lines.append(f"Categorie caricate da tipologie.dbf: {len(tipi)}")
+    exact_active = 0
+    exact_deleted = 0
+    malformed = 0
+    for i in range(num_records):
+        base = header_len + i * record_len
+        rec = dbf[base:base + record_len]
+        if len(rec) != record_len:
+            lines.append(f"ATTENZIONE: record DBF #{i + 1} incompleto: file potenzialmente troncato")
+            break
+        raw = rec[ean_offset:ean_offset + ean_length]
+        decoded = raw.decode("cp1252" if ean_ftype == "C" else "ascii", errors="replace")
+        raw_ean = decoded.strip()
+        is_exact = raw_ean == ean
+        whitespace_altered = not is_exact and "".join(raw_ean.split()) == ean
+        if not (is_exact or whitespace_altered):
+            continue
+        if rec[0] == 0x2A:  # record cancellato nel DBF
+            exact_deleted += 1
+            lines.append(f"Record #{i + 1}: CANCELLATO nel DBF; escluso dal sincronizzatore")
+            continue
+        if whitespace_altered:
+            malformed += 1
+            lines.append(
+                f"Record #{i + 1}: EAN con spazi INTERNI ({raw_ean!r}); "
+                "il sincronizzatore lo esclude per sicurezza"
+            )
+            continue
+        exact_active += 1
+        row = parse_record(dbf, offsets, header_len, record_len, i) or {}
+        id_tipo = get_ci(row, "Id_tipo", "ID_TIPO", "IDTIPO", default=None)
+        try:
+            mapped = tipi.get(int(id_tipo), "") if id_tipo is not None else ""
+        except (TypeError, ValueError):
+            mapped = ""
+        categoria = mapped.strip()
+        titolo = clean_str(get_ci(row, "TITOLO", default=""))
+        giacenza = get_ci(row, "GIACENTI", default=None)
+        lines.append(
+            f"Record #{i + 1}: ATTIVO | titolo={titolo!r} | "
+            f"Id_tipo={id_tipo!r} | categoria={categoria!r} | GIACENTI={giacenza}"
+        )
+        if not categoria:
+            lines.append(
+                "  CAUSA: categoria assente/non riconosciuta in tipologie.dbf; "
+                "verificare la corrispondenza di Id_tipo."
+            )
+        elif categoria.upper() != "SCOLASTICO":
+            lines.append(
+                "  CAUSA: categoria diversa da SCOLASTICO; "
+                "la migrazione la esclude volutamente."
+            )
+        else:
+            lines.append("  Categoria SCOLASTICO riconosciuta correttamente.")
+
+    if not (exact_active or exact_deleted or malformed):
+        lines.append(
+            "ESITO: EAN non trovato in nessun record di testi.dbf "
+            "(anche prima del filtro SCOLASTICO)."
+        )
+        lines.append(
+            "Verificare che DATA_DIR punti al gestionale giusto, che il DBF sia "
+            "aggiornato e che CODICE_EAN contenga esattamente questo EAN."
+        )
+    elif exact_active > 1:
+        lines.append(
+            f"ATTENZIONE: {exact_active} record ATTIVI con lo stesso EAN; "
+            "la migrazione blocca gli EAN duplicati."
+        )
+    elif exact_active == 1:
+        lines.append("ESITO: record attivo identificato; controllare la categoria mostrata sopra.")
+    else:
+        lines.append("ESITO: nessun record attivo utilizzabile per questo EAN.")
+    return "\n".join(lines)
+
+
+# =============================================================================
 # Bulk mutation strings
 # =============================================================================
 
@@ -1608,7 +1728,7 @@ def is_running_as_exe() -> bool:
 QUERY_VARIANTS_BY_SKU = """
 query VariantsBySku($search: String!, $after: String) {
   productVariants(first: 50, after: $after, query: $search) {
-    nodes { id sku product { id } inventoryItem { id tracked } }
+    nodes { id sku inventoryPolicy product { id } inventoryItem { id tracked } }
     pageInfo { hasNextPage endCursor }
   }
 }
@@ -1648,7 +1768,8 @@ def find_variant_by_exact_sku(endpoint: str, ean: str) -> Optional[Dict[str, Any
                     "product_id": prod.get("id"),
                     "variant_id": variant_id,
                     "inventory_item_id": inv.get("id"),
-                    "tracked": inv.get("tracked", False)
+                    "tracked": inv.get("tracked", False),
+                    "inventory_policy": variant.get("inventoryPolicy")
                 }
         pg = conn.get("pageInfo") or {}
         if not pg.get("hasNextPage"):
@@ -1677,7 +1798,10 @@ def shared_inventory_ids(prev: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]
 
 def prepare_inventory_row(item: Dict[str, Any], found: Dict[str, Any]) -> Dict[str, Any]:
     if not found.get("inventory_item_id") or not found.get("tracked"):
-        raise ValueError(f"EAN {item['ean']}: variante senza inventario monitorato; nessuna scrittura")
+        raise ValueError(
+            f"EAN {item['ean']}: variante senza inventario monitorato; "
+            "eseguire --migrate-scolastico --apply se categoria SCOLASTICO"
+        )
     return {
         **item,
         "product_id": found["product_id"],
@@ -1788,8 +1912,386 @@ def inventory_batch_update_resilient(
     send(batch)
 
 
+
+# =============================================================================
+# Migrazione esplicita prodotti SCOLASTICO già presenti su Shopify.
+# Eseguibile in modalità anteprima; non modifica prezzi, immagini né prodotti.
+# Si usa lo stesso lock della sincronizzazione Windows per evitare collisioni.
+# =============================================================================
+
+QUERY_VARIANT_INVENTORY_STATUS = """
+query VariantInventoryStatus($id: ID!, $locationId: ID!) {
+  productVariant(id: $id) {
+    id
+    sku
+    inventoryPolicy
+    product { id }
+    inventoryItem {
+      id
+      tracked
+      inventoryLevel(locationId: $locationId) {
+        id
+        quantities(names: ["available"]) { name quantity }
+      }
+    }
+  }
+}
+""".strip()
+
+MUTATION_VARIANT_CONTINUE = """
+mutation SetScolasticoContinue($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+    productVariants { id inventoryPolicy }
+    userErrors { field message }
+  }
+}
+""".strip()
+
+MUTATION_ITEM_TRACKED = """
+mutation TrackScolasticoItem($id: ID!, $input: InventoryItemInput!) {
+  inventoryItemUpdate(id: $id, input: $input) {
+    inventoryItem { id tracked }
+    userErrors { field message }
+  }
+}
+""".strip()
+
+MUTATION_INVENTORY_ACTIVATE = """
+mutation ActivateScolasticoInventory($inventoryItemId: ID!, $locationId: ID!, $key: String!) {
+  inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId)
+    @idempotent(key: $key) {
+    inventoryLevel { id }
+    userErrors { field message }
+  }
+}
+""".strip()
+
+
+def read_variant_inventory_status(endpoint: str, variant_id: str) -> Dict[str, Any]:
+    response = shopify_graphql(
+        endpoint, SHOPIFY_ACCESS_TOKEN, QUERY_VARIANT_INVENTORY_STATUS,
+        {"id": variant_id, "locationId": SHOPIFY_LOCATION_ID}
+    )
+    variant = (response.get("data") or {}).get("productVariant")
+    if not isinstance(variant, dict):
+        raise RuntimeError(f"Variante Shopify non trovata per ID {variant_id}")
+    return variant
+
+
+def _available_from_variant_status(variant: Dict[str, Any]) -> Optional[int]:
+    level = ((variant.get("inventoryItem") or {}).get("inventoryLevel"))
+    if level is None:
+        return None
+    for q in level.get("quantities") or []:
+        if q.get("name") == "available":
+            return int(q["quantity"])
+    return None  # possibile sugli articoli precedentemente non monitorati
+
+
+def checked_mutation_payload(endpoint: str, query: str, variables: Dict[str, Any], key: str) -> Dict[str, Any]:
+    response = shopify_graphql(endpoint, SHOPIFY_ACCESS_TOKEN, query, variables)
+    payload = (response.get("data") or {}).get(key)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Mutazione {key}: payload assente")
+    if payload.get("userErrors"):
+        raise RuntimeError(
+            f"Mutazione {key}: " + json.dumps(payload["userErrors"], ensure_ascii=False)
+        )
+    return payload
+
+
+# Non ripete le mutazioni in presenza di uno stato Shopify eventualmente
+# non ancora aggiornato nelle query: ripete soltanto la lettura.
+SCOLASTICO_VERIFY_ATTEMPTS = max(1, min(10, _env_int("SCOLASTICO_VERIFY_ATTEMPTS", "5")))
+SCOLASTICO_VERIFY_DELAY_SECONDS = max(0, min(15, _env_int("SCOLASTICO_VERIFY_DELAY_SECONDS", "2")))
+
+
+def _scolastico_status_snapshot(variant: Dict[str, Any]) -> Dict[str, Any]:
+    """Stato minimale per log; non include segreti, descrizioni o dati clienti."""
+    item = variant.get("inventoryItem") or {}
+    level = item.get("inventoryLevel")
+    return {
+        "sku": variant.get("sku"),
+        "product_id": (variant.get("product") or {}).get("id"),
+        "variant_id": variant.get("id"),
+        "inventory_item_id": item.get("id"),
+        "inventory_policy": variant.get("inventoryPolicy"),
+        "tracked": item.get("tracked"),
+        "inventory_level_id": level.get("id") if isinstance(level, dict) else None,
+        "available": _available_from_variant_status(variant),
+        "location_id_verificata": SHOPIFY_LOCATION_ID,
+    }
+
+
+def _scolastico_verification_differences(
+    variant: Dict[str, Any], *, ean: str, product_id: str,
+    variant_id: str, inv_id: str, quantity: int
+) -> Dict[str, Dict[str, Any]]:
+    actual = _scolastico_status_snapshot(variant)
+    expected = {
+        "sku": ean,
+        "product_id": product_id,
+        "variant_id": variant_id,
+        "inventory_item_id": inv_id,
+        "inventory_policy": "CONTINUE",
+        "tracked": True,
+        "available": quantity,
+    }
+    return {name: {"atteso": want, "shopify": actual[name]}
+            for name, want in expected.items() if actual[name] != want}
+
+
+def _verify_scolastico_with_reads(
+    endpoint: str, *, ean: str, product_id: str,
+    variant_id: str, inv_id: str, quantity: int,
+) -> Dict[str, Any]:
+    """Conferma lo stato con sole query, con attesa breve per ritardi di lettura."""
+    after = {}
+    differences = {}
+    for attempt in range(1, SCOLASTICO_VERIFY_ATTEMPTS + 1):
+        after = read_variant_inventory_status(endpoint, variant_id)
+        differences = _scolastico_verification_differences(
+            after, ean=ean, product_id=product_id,
+            variant_id=variant_id, inv_id=inv_id, quantity=quantity
+        )
+        if not differences:
+            if attempt > 1:
+                logger.info("[migrazione] EAN=%s confermato al tentativo di lettura %s/%s",
+                            ean, attempt, SCOLASTICO_VERIFY_ATTEMPTS)
+            return after
+        logger.warning(
+            "[migrazione] EAN=%s verifica %s/%s non conforme: %s",
+            ean, attempt, SCOLASTICO_VERIFY_ATTEMPTS,
+            json.dumps(differences, ensure_ascii=False)
+        )
+        if attempt < SCOLASTICO_VERIFY_ATTEMPTS:
+            time.sleep(SCOLASTICO_VERIFY_DELAY_SECONDS)
+    raise RuntimeError(
+        f"EAN {ean}: verifica finale fallita dopo {SCOLASTICO_VERIFY_ATTEMPTS} letture, "
+        "hash NON registrato; differenze=" +
+        json.dumps(differences, ensure_ascii=False, sort_keys=True) +
+        "; stato Shopify=" +
+        json.dumps(_scolastico_status_snapshot(after), ensure_ascii=False, sort_keys=True)
+    )
+
+
+def migrate_one_scolastico(
+    endpoint: str, state: SyncState, run_id: int, row: Dict[str, Any],
+    found: Dict[str, Any]
+) -> str:
+    """Migrazione ripetibile; conferma l'hash solo dopo verifica finale.
+
+    Ordinamento indispensabile: CONTINUE prima di tracked=True, quindi
+    attivazione sede (se non esiste) e scrittura quantità assoluta.
+    """
+    ean = clean_str(get_ci(row, "CODICE_EAN"))
+    product_id = found.get("product_id")
+    variant_id = found.get("variant_id")
+    inv_id = found.get("inventory_item_id")
+    if not (product_id and variant_id and inv_id):
+        raise ValueError(f"EAN {ean}: ID Shopify incompleti")
+    before = read_variant_inventory_status(endpoint, variant_id)
+    before_item = before.get("inventoryItem") or {}
+    if (before.get("sku") != ean or before.get("id") != variant_id or
+            (before.get("product") or {}).get("id") != product_id or
+            before_item.get("id") != inv_id):
+        raise ValueError(f"EAN {ean}: variante/InventoryItem non coerenti; bloccata migrazione")
+    qty = get_row_stock_quantity(row)
+    original_policy = before.get("inventoryPolicy")
+    original_tracked = bool(before_item.get("tracked"))
+    old_qty = _available_from_variant_status(before)
+    if original_policy != "CONTINUE":
+        payload = checked_mutation_payload(
+            endpoint, MUTATION_VARIANT_CONTINUE,
+            {"productId": product_id,
+             "variants": [{"id": variant_id, "inventoryPolicy": "CONTINUE"}]},
+            "productVariantsBulkUpdate"
+        )
+        variants = payload.get("productVariants") or []
+        if not any(v.get("id") == variant_id and v.get("inventoryPolicy") == "CONTINUE"
+                   for v in variants):
+            raise RuntimeError(f"EAN {ean}: CONTINUE non confermato da Shopify")
+
+    if not original_tracked:
+        payload = checked_mutation_payload(
+            endpoint, MUTATION_ITEM_TRACKED,
+            {"id": inv_id, "input": {"tracked": True}}, "inventoryItemUpdate"
+        )
+        item = payload.get("inventoryItem") or {}
+        if item.get("id") != inv_id or item.get("tracked") is not True:
+            raise RuntimeError(f"EAN {ean}: tracked=True non confermato da Shopify")
+        logger.info("[migrazione] EAN=%s: inventoryItemUpdate ha confermato tracked=True", ean)
+
+    # inventoryLevel puo' non esistere finché il prodotto non viene attivato
+    # sulla SHOPIFY_LOCATION_ID, indipendentemente dal flag 'tracked'.
+    current = read_variant_inventory_status(endpoint, variant_id)
+    needs_activation = ((current.get("inventoryItem") or {}).get("inventoryLevel")) is None
+    if needs_activation:
+        stable_key = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"scolastico-inventory-activate|{run_id}|{ean}|{inv_id}|{SHOPIFY_LOCATION_ID}"
+        ))
+        activation_payload = checked_mutation_payload(
+            endpoint, MUTATION_INVENTORY_ACTIVATE,
+            {"inventoryItemId": inv_id, "locationId": SHOPIFY_LOCATION_ID, "key": stable_key},
+            "inventoryActivate"
+        )
+        logger.info("[migrazione] EAN=%s: inventoryActivate livello=%s",
+                    ean, (activation_payload.get("inventoryLevel") or {}).get("id"))
+
+    # Scrittura assoluta: DBF è la fonte della giacenza. Anche se il numero è
+    # identico, registriamo lo stato migrato solo dopo il riscontro da Shopify.
+    if (needs_activation or not original_tracked or
+            _available_from_variant_status(current) != qty):
+        result = inventory_set_available_batch(
+            endpoint, [(inv_id, qty)],
+            reference_document_uri=f"gid://erp-connector/ScolasticoMigration/run-{run_id}"
+        )
+        errors = inventory_errors(result)
+        if errors:
+            raise RuntimeError(f"EAN {ean}: inventorySetQuantities: {json.dumps(errors, ensure_ascii=False)}")
+        payload = (result.get("data") or {}).get("inventorySetQuantities") or {}
+        logger.info("[migrazione] EAN=%s: inventorySetQuantities accettata, "
+                    "quantity_richiesta=%d, adjustmentGroup=%s", ean, qty,
+                    json.dumps(payload.get("inventoryAdjustmentGroup"), ensure_ascii=False))
+
+    _verify_scolastico_with_reads(
+        endpoint, ean=ean, product_id=product_id,
+        variant_id=variant_id, inv_id=inv_id, quantity=qty
+    )
+
+    state.upsert_items_many([(
+        run_id, ean, compute_row_hash(row), product_id, variant_id, inv_id
+    )])
+    state.mark_link_verified(ean, inv_id)
+    state.clear_issue(ean)
+    return (f"policy {original_policy}->CONTINUE | tracked {original_tracked}->True | "
+            f"qty {old_qty}->{qty}")
+
+
+def migrate_scolastico_cli(args: argparse.Namespace) -> None:
+    """Anteprima di default; --apply richiede volontariamente l'esecuzione."""
+    if args.apply and args.dry_run:
+        raise ValueError("Non usare --apply insieme a --dry-run")
+    if args.apply and DRY_RUN:
+        raise RuntimeError("DRY_RUN=1 in config.env: impostare DRY_RUN=0 prima di --apply")
+    if not SHOPIFY_SHOP or not SHOPIFY_ACCESS_TOKEN or not SHOPIFY_LOCATION_ID:
+        raise RuntimeError("config.env: SHOPIFY_SHOP, SHOPIFY_ACCESS_TOKEN e SHOPIFY_LOCATION_ID obbligatori")
+    if LIMIT_RECORDS:
+        raise RuntimeError("Per la migrazione impostare LIMIT_RECORDS=0 in config.env")
+    if not Path(STATE_DB_PATH).is_file():
+        raise RuntimeError(f"DB stato esistente non trovato: {STATE_DB_PATH}")
+
+    rows = read_testi_records()
+    # Come nel sync ordinario, l'ultima occorrenza DBF è quella autorevole;
+    # ma durante la migrazione blocchiamo gli EAN duplicati, anche se la
+    # categoria cambia tra record, per evitare conversioni della variante errata.
+    latest_rows = {}
+    duplicate_eans = set()
+    for row in rows:
+        ean = clean_str(get_ci(row, "CODICE_EAN", default=""))
+        if ean in latest_rows:
+            duplicate_eans.add(ean)
+        latest_rows[ean] = row
+    scolastici = {ean: row for ean, row in latest_rows.items() if is_scolastico(row)}
+    if args.ean:
+        scolastici = {ean: row for ean, row in scolastici.items() if ean == args.ean}
+        if not scolastici:
+            # Il messaggio precedente confondeva "EAN assente" con
+            # "EAN presente ma classificato in un'altra categoria".
+            raise RuntimeError(
+                f"EAN {args.ean} non selezionabile per la migrazione SCOLASTICO.\n"
+                + diagnose_ean_dbf(args.ean)
+            )
+    if args.limit is not None:
+        if args.limit < 1:
+            raise ValueError("--limit deve essere un intero positivo")
+        scolastici = dict(list(scolastici.items())[:args.limit])
+    if duplicate_eans.intersection(scolastici):
+        raise RuntimeError(
+            "EAN scolastici duplicati nel DBF: " +
+            ", ".join(sorted(duplicate_eans.intersection(scolastici))[:10]) +
+            ". Correggere prima di migrare."
+        )
+    endpoint = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    stats = {"scanned": 0, "migrated": 0, "missing_on_shopify": 0, "failed": 0}
+    state = SyncState(STATE_DB_PATH, read_only=not args.apply)
+    try:
+        if args.apply:
+            # Backup aggiuntivo per la migrazione (SQLite backup API, gestisce WAL).
+            target = Path(STATE_DB_PATH).with_name(
+                "shopify_sync_state_pre_scolastico_" +
+                datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite"
+            )
+            with sqlite3.connect(str(target)) as dest:
+                state.conn.backup(dest)
+            logger.info("Backup SQLite prima della migrazione: %s", target)
+            run_id = state.start_run()
+        else:
+            run_id = None
+        try:
+            logger.info("MIGRAZIONE SCOLASTICO | modalità=%s | EAN selezionati=%d | sede=%s",
+                        "APPLY" if args.apply else "ANTEPRIMA (sola lettura)",
+                        len(scolastici), SHOPIFY_LOCATION_ID)
+            for ean, row in scolastici.items():
+                stats["scanned"] += 1
+                try:
+                    found = find_variant_by_exact_sku(endpoint, ean)
+                    if not found:
+                        logger.warning("[migrazione] EAN %s: non presente su Shopify; non creato", ean)
+                        stats["missing_on_shopify"] += 1
+                        continue
+                    variant = read_variant_inventory_status(endpoint, found["variant_id"])
+                    inv = variant.get("inventoryItem") or {}
+                    if (variant.get("sku") != ean or
+                            variant.get("id") != found.get("variant_id") or
+                            (variant.get("product") or {}).get("id") != found.get("product_id") or
+                            inv.get("id") != found.get("inventory_item_id")):
+                        raise ValueError("Verifica identità SKU/ID non riuscita")
+                    qty = _available_from_variant_status(variant)
+                    logger.info("[migrazione] EAN=%s | tracked=%s | policy=%s | qty Shopify=%s | qty DBF=%d",
+                                ean, inv.get("tracked"), variant.get("inventoryPolicy"),
+                                qty, get_row_stock_quantity(row))
+                    if args.apply:
+                        change = migrate_one_scolastico(endpoint, state, run_id, row, found)
+                        stats["migrated"] += 1
+                        logger.info("[migrazione] OK EAN=%s | %s", ean, change)
+                except Exception as exc:
+                    stats["failed"] += 1
+                    logger.exception("[migrazione] ERRORE EAN=%s: %s", ean, exc)
+                    if args.apply:
+                        # Non avanzare hash per un errore; la migrazione è rilanciabile.
+                        state.record_issue(ean, "migrazione SCOLASTICO: " + str(exc))
+        finally:
+            if run_id is not None:
+                state.finish_run(run_id)
+        logger.info("MIGRAZIONE RIEPILOGO: %s", stats)
+        if stats["failed"]:
+            raise RuntimeError(f"Migrazione con {stats['failed']} errori; consultare shopify_sync.log")
+        if args.apply and stats["missing_on_shopify"]:
+            logger.warning("%d EAN non esistono su Shopify: saranno gestiti dalla normale sincronizzazione",
+                           stats["missing_on_shopify"])
+    finally:
+        state.conn.close()
+
+
+def get_migration_args() -> Optional[argparse.Namespace]:
+    # Mantiene invariata l'interfaccia del Task Scheduler (senza argomenti).
+    if "--migrate-scolastico" not in sys.argv:
+        return None
+    parser = argparse.ArgumentParser(
+        description="Migrazione scorte SCOLASTICO: anteprima di default; --apply per scrivere"
+    )
+    parser.add_argument("--migrate-scolastico", action="store_true", required=True)
+    parser.add_argument("--apply", action="store_true", help="Abilita le modifiche su Shopify e SQLite")
+    parser.add_argument("--dry-run", action="store_true", help="Sola lettura (default)")
+    parser.add_argument("--ean", type=str, help="Esegue la migrazione di un solo EAN")
+    parser.add_argument("--limit", type=int, help="Limita il numero di EAN controllati")
+    return parser.parse_args()
+
+
 def main() -> None:
-    logger.info("=== AVVIO SYNC SHOPIFY - VERSIONE SICURA V2 ===")
+    logger.info("=== AVVIO SYNC SHOPIFY - V3 (SCOLASTICO MONITORATO + CONTINUE) ===")
     logger.info(f"APP_DIR: {SCRIPT_DIR} | config: {ENV_PATH}")
     logger.info(f"State DB: {STATE_DB_PATH} | log: {LOG_PATH}")
     logger.info("WordPress cover: %s | azzera EAN scomparsi: %s | DRY_RUN: %s",
@@ -1819,13 +2321,13 @@ def main() -> None:
                 continue
             h = compute_row_hash(row)
             # I duplicati devono essere verificati anche se la scorta non varia.
-            if not is_scolastico(row) and (old["row_hash"] != h or ean in dup_eans):
+            if old["row_hash"] != h or ean in dup_eans:
                 changed.append({
                     "ean": ean, "row_hash": h, "quantity": get_row_stock_quantity(row),
                     "product_id": old.get("product_id"),
                     "variant_id": old.get("variant_id"),
                     "inventory_item_id": old.get("inventory_item_id"),
-                    "needs_verification": ean in dup_eans
+                    "needs_verification": ean in dup_eans or is_scolastico(row)
                 })
             else:
                 unchanged_rows.append((ean, h, old))
@@ -1877,18 +2379,19 @@ def main() -> None:
                 try:
                     found = find_variant_by_exact_sku(endpoint, ean)
                     if found:
-                        if is_scolastico(row):
-                            state.upsert_items_many([(
-                                run_id, ean, h, found["product_id"],
-                                found["variant_id"], found["inventory_item_id"]
-                            )])
-                            logger.info("EAN scolastico %s: collegato a prodotto Shopify gia' esistente", ean)
-                        else:
-                            changed.append(prepare_inventory_row({
-                                "ean": ean, "row_hash": h,
-                                "quantity": get_row_stock_quantity(row)
-                            }, found))
-                            logger.info("EAN %s: presente su Shopify, collego senza ricrearlo", ean)
+                        # Anche SCOLASTICO va sincronizzato. Se il prodotto
+                        # preesistente non è monitorato, l'operatore esegue
+                        # prima --migrate-scolastico --apply.
+                        if is_scolastico(row) and found.get("inventory_policy") != "CONTINUE":
+                            raise ValueError(
+                                "SCOLASTICO esistente con policy diversa da CONTINUE: "
+                                "eseguire --migrate-scolastico --apply"
+                            )
+                        changed.append(prepare_inventory_row({
+                            "ean": ean, "row_hash": h,
+                            "quantity": get_row_stock_quantity(row)
+                        }, found))
+                        logger.info("EAN %s: presente su Shopify, collego senza ricrearlo", ean)
                     else:
                         truly_new.append({"ean": ean, "row_hash": h, "row": row})
                 except (AmbiguousSkuMatch, ValueError) as exc:
@@ -1984,6 +2487,11 @@ def main() -> None:
                         found = find_variant_by_exact_sku(endpoint, ean)
                         if not found:
                             raise LookupError("EAN/SKU esatto non trovato su Shopify")
+                        if is_scolastico(current_rows[ean]) and found.get("inventory_policy") != "CONTINUE":
+                            raise ValueError(
+                                "SCOLASTICO con inventoryPolicy diversa da CONTINUE: "
+                                "eseguire --migrate-scolastico --apply"
+                            )
                         item = prepare_inventory_row(item, found)
                         logger.info("EAN %s: variante verificata tramite SKU; ID=%s",
                                     ean, item["inventory_item_id"])
@@ -2176,7 +2684,19 @@ if __name__ == "__main__":
         sys.exit(2)
 
     try:
-        main()
+        if "--diagnose-ean" in sys.argv:
+            parser = argparse.ArgumentParser(
+                description="Diagnostica locale EAN in testi.dbf/tipologie.dbf: nessuna chiamata Shopify"
+            )
+            parser.add_argument("--diagnose-ean", required=True, metavar="EAN")
+            options = parser.parse_args()
+            print(diagnose_ean_dbf(options.diagnose_ean))
+        else:
+            migration_args = get_migration_args()
+            if migration_args is not None:
+                migrate_scolastico_cli(migration_args)
+            else:
+                main()
     except Exception:
         import traceback
 
