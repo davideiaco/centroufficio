@@ -1,6 +1,8 @@
 # =============================================================================
-# VERSIONE SICURA V2 - migrazione da conn_sync_bulk originale
-# Inventory ID riparati per SKU, bulk per __lineNumber, batch resilienti
+# VERSIONE V4 - conn_sync_bulk + sincronizzazione libri usati
+# Mantiene: Inventory ID riparati per SKU, bulk per __lineNumber, batch resilienti.
+# Aggiunge: varianti condizione Nuovo/Buono/Usurato, sconti config.env,
+#            tabella used_variants e azzeramento usati non piu' disponibili.
 # - SCONTO letto come percentuale, anche con virgola: 5,04 / 5,04%
 # - Calcolo con Decimal, senza float
 # - Prezzo finale troncato a 2 decimali con ROUND_DOWN, non arrotondato
@@ -130,6 +132,18 @@ TIPOLOGIE_DBF_FILENAME = _env("TIPOLOGIE_DBF_FILENAME", "tipologie.dbf")
 DBF_PATH = os.path.join(DATA_DIR, DBF_FILENAME)
 FPT_PATH = os.path.join(DATA_DIR, FPT_FILENAME)
 TIPOLOGIE_DBF_PATH = os.path.join(DATA_DIR, TIPOLOGIE_DBF_FILENAME)
+
+# Usati: le tre soglie sono lette da config.env a ogni avvio.
+USATI_SYNC_ENABLED = _env_bool("USATI_SYNC_ENABLED", "1")
+USATI_DBF_FILENAME = _env("USATI_DBF_FILENAME", "c_usa_test.dbf")
+USATI_DBF_PATH = os.path.join(DATA_DIR, USATI_DBF_FILENAME)
+USATI_SCONTO_ESCLUSO_RAW = _env("USATI_SCONTO_ESCLUSO", "40")
+USATI_SCONTO_BUONO_RAW = _env("USATI_SCONTO_BUONO", "41")
+USATI_SCONTO_USURATO_RAW = _env("USATI_SCONTO_USURATO", "42")
+USATI_MAX_VARIANTS_PER_RUN = _env_int("USATI_MAX_VARIANTS_PER_RUN", "50")
+USATI_OPTION_NAME = "Condizione"
+USATI_CONDITION_NAMES = {"BUONO": "Usato in buone condizioni", "USURATO": "Usato usurato"}
+USATI_SKU_SUFFIXES = {"BUONO": "-UB", "USURATO": "-UU"}
 
 SHOPIFY_SHOP = _env("SHOPIFY_SHOP", "")
 SHOPIFY_ACCESS_TOKEN = _env("SHOPIFY_ACCESS_TOKEN", "")
@@ -1068,6 +1082,54 @@ def to_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
+def used_discount_settings() -> Dict[str, Decimal]:
+    """Confronti esatti con Decimal: niente conversioni silenziose di valori errati."""
+    raw = {
+        "ESCLUSO": USATI_SCONTO_ESCLUSO_RAW,
+        "BUONO": USATI_SCONTO_BUONO_RAW,
+        "USURATO": USATI_SCONTO_USURATO_RAW,
+    }
+    out: Dict[str, Decimal] = {}
+    for key, value in raw.items():
+        try:
+            out[key] = Decimal(normalize_decimal_text(value))
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError(f"config.env: USATI_SCONTO_{key} non valido: {value!r}")
+        if not (Decimal("0") <= out[key] <= Decimal("100")):
+            raise ValueError(f"config.env: USATI_SCONTO_{key} deve essere fra 0 e 100")
+    if len(set(out.values())) != 3:
+        raise ValueError("config.env: i tre sconti usati devono essere differenti")
+    return out
+
+
+def used_sku(ean: str, condition_key: str) -> str:
+    return ean + USATI_SKU_SUFFIXES[condition_key]
+
+
+def compute_used_hash(offer: Dict[str, Any]) -> str:
+    payload = {
+        "ean": offer["ean"],
+        "condition_key": offer["condition_key"],
+        "quantity": int(offer["quantity"]),
+        "price": offer["price"],
+        "compare_at_price": offer["compare_at_price"],
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def used_offer_for_zero(ean: str, condition_key: str, old: Dict[str, Any]) -> Dict[str, Any]:
+    offer = {
+        "ean": ean,
+        "condition_key": condition_key,
+        "quantity": 0,
+        "price": old["price"],
+        "compare_at_price": old["compare_at_price"],
+    }
+    offer["row_hash"] = compute_used_hash(offer)
+    return offer
+
+
 def clamp_percent(value: Decimal) -> Decimal:
     if value < Decimal("0"):
         return Decimal("0")
@@ -1086,6 +1148,7 @@ def build_productset_input_from_testi_row(
     *,
     include_files: bool = True,
     wordpress_cover_by_ean: Optional[Dict[str, str]] = None,
+    used_offers: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     titolo = clean_str(get_ci(row, "TITOLO", default=""))
     sottotitolo = clean_str(get_ci(row, "Sotto_tit", "SOTTO_TIT", "SOTTOTIT", "SOTTOTITOLO", default=""))
@@ -1225,6 +1288,38 @@ def build_productset_input_from_testi_row(
         "metafields": metafields,
     }
 
+    # Su un prodotto nuovo, le varianti usate vengono create nello stesso productSet.
+    # Per prodotti ESISTENTI non inviare mai un productSet con varianti parziali:
+    # Shopify potrebbe cancellare le varianti omesse.
+    if used_offers:
+        condition_keys = [key for key in ("BUONO", "USURATO") if key in used_offers]
+        if condition_keys:
+            variant_obj["optionValues"] = [{"optionName": USATI_OPTION_NAME, "name": "Nuovo"}]
+            input_obj["productOptions"] = [{
+                "name": USATI_OPTION_NAME,
+                "position": 1,
+                "values": [{"name": name} for name in
+                           (["Nuovo"] + [USATI_CONDITION_NAMES[key] for key in condition_keys])],
+            }]
+            for key in condition_keys:
+                offer = used_offers[key]
+                uv = {
+                    "sku": used_sku(ean, key),
+                    "price": offer["price"],
+                    "optionValues": [{"optionName": USATI_OPTION_NAME,
+                                      "name": USATI_CONDITION_NAMES[key]}],
+                    "inventoryItem": {"tracked": True},
+                    "inventoryPolicy": "DENY",
+                    "inventoryQuantities": [{
+                        "locationId": SHOPIFY_LOCATION_ID,
+                        "name": "available",
+                        "quantity": int(offer["quantity"]),
+                    }],
+                }
+                if offer["compare_at_price"]:
+                    uv["compareAtPrice"] = offer["compare_at_price"]
+                input_obj["variants"].append(uv)
+
     # IMPORTANTE:
     # L'immagine va inviata a Shopify solo in creazione.
     # In modifica NON bisogna passare il campo "files", così Shopify non tocca
@@ -1308,6 +1403,25 @@ class SyncState:
             self.conn = sqlite3.connect(path)
             self.conn.execute("PRAGMA journal_mode=WAL;")
             self.conn.execute("PRAGMA synchronous=NORMAL;")
+            # Prima di aggiungere la tabella v4, backup una tantum dello stato
+            # esistente mediante SQLite backup API (consistente anche in WAL).
+            old_schema = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='items'"
+            ).fetchone()
+            already_used = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='used_variants'"
+            ).fetchone()
+            if old_schema and not already_used:
+                target = Path(path).with_name(
+                    "shopify_sync_state_pre_usati_" +
+                    datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite"
+                )
+                dest = sqlite3.connect(str(target))
+                try:
+                    self.conn.backup(dest)
+                finally:
+                    dest.close()
+                logger.info("Backup automatico dello stato prima di USATI V4: %s", target)
             self._init_schema()
 
     def _init_schema(self) -> None:
@@ -1329,6 +1443,21 @@ class SyncState:
             finished_at TEXT
         );
         """)
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS used_variants (
+            ean TEXT NOT NULL,
+            condition_key TEXT NOT NULL,
+            row_hash TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price TEXT NOT NULL,
+            compare_at_price TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            variant_id TEXT NOT NULL,
+            inventory_item_id TEXT NOT NULL,
+            last_seen_run INTEGER NOT NULL,
+            last_synced_at TEXT NOT NULL,
+            PRIMARY KEY(ean, condition_key)
+        )""")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_items_last_seen ON items(last_seen_run);")
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS sync_issues (
@@ -1349,6 +1478,36 @@ class SyncState:
             zeroed_at TEXT NOT NULL
         )""")
         self.conn.commit()
+
+    def unlock_v4_used_schema_errors_once(self) -> int:
+        """Sblocca UNA SOLA VOLTA i tentativi V4 rifiutati da GraphQL.
+
+        Nel V4 Shopify ha respinto l'input inventoryQuantities e il normale
+        cooldown di 60 minuti ritarderebbe la riparazione. Si cancella solo
+        il cooldown dei problemi degli USATI con quell'esatto messaggio,
+        senza alterare i collegamenti, le giacenze o altri errori.
+        """
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )""")
+        marker = "v5_bulk_create_inventory_level_input_fix"
+        if self.conn.execute(
+            "SELECT 1 FROM sync_migrations WHERE name=?", (marker,)
+        ).fetchone():
+            return 0
+        cur = self.conn.execute("""
+            DELETE FROM sync_issues
+             WHERE ean LIKE '%#USATO-%'
+               AND reason = 'Shopify GraphQL ha restituito errori top-level'
+        """)
+        self.conn.execute(
+            "INSERT INTO sync_migrations(name, applied_at) VALUES (?, ?)",
+            (marker, datetime.datetime.now(datetime.UTC).isoformat())
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     def start_run(self) -> int:
         now = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1402,6 +1561,48 @@ class SyncState:
         """, payload)
         self.conn.commit()
 
+
+    def load_used(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        # --check deve essere compatibile anche con SQLite della versione vecchia.
+        present = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='used_variants'"
+        ).fetchone()
+        if not present:
+            return {}
+        sql = ("SELECT ean, condition_key, row_hash, quantity, price, compare_at_price, "
+               "product_id, variant_id, inventory_item_id FROM used_variants")
+        return {
+            (ean, condition_key): {
+                "ean": ean, "condition_key": condition_key,
+                "row_hash": row_hash, "quantity": quantity,
+                "price": price, "compare_at_price": compare_at_price,
+                "product_id": product_id, "variant_id": variant_id,
+                "inventory_item_id": inventory_item_id,
+            }
+            for ean, condition_key, row_hash, quantity, price, compare_at_price,
+                product_id, variant_id, inventory_item_id in self.conn.execute(sql)
+        }
+
+    def upsert_used(self, run_id: int, offer: Dict[str, Any],
+                    product_id: str, variant_id: str, inventory_item_id: str) -> None:
+        if not (product_id and variant_id and inventory_item_id):
+            raise ValueError("Impossibile salvare variante usata senza ID Shopify completi")
+        now = datetime.datetime.now(datetime.UTC).isoformat()
+        self.conn.execute("""
+        INSERT INTO used_variants
+          (ean, condition_key, row_hash, quantity, price, compare_at_price,
+           product_id, variant_id, inventory_item_id, last_seen_run, last_synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ean, condition_key) DO UPDATE SET
+          row_hash=excluded.row_hash, quantity=excluded.quantity,
+          price=excluded.price, compare_at_price=excluded.compare_at_price,
+          product_id=excluded.product_id, variant_id=excluded.variant_id,
+          inventory_item_id=excluded.inventory_item_id,
+          last_seen_run=excluded.last_seen_run, last_synced_at=excluded.last_synced_at
+        """, (offer["ean"], offer["condition_key"], offer["row_hash"],
+              int(offer["quantity"]), offer["price"], offer["compare_at_price"],
+              product_id, variant_id, inventory_item_id, run_id, now))
+        self.conn.commit()
 
     def backup_once_for_upgrade(self) -> None:
         """Copia consistente fatta con SQLite backup API alla prima esecuzione v2."""
@@ -1559,6 +1760,126 @@ def read_testi_records() -> List[Dict[str, Any]]:
             break
 
     return selected
+
+
+# =============================================================================
+# Aggregazione c_usa_test.dbf: copie disponibili per ISBN e CONDIZIONE
+# =============================================================================
+
+def read_used_offers(
+    testi_rows: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, int]]:
+    """Legge gli usati confermati/non cancellati, unisce per ID_TESTO.
+
+    Il 40% (o soglia escluso) non viene mai pubblicato. Sconti differenti
+    dalle tre soglie sono ignorati e segnalati. Prezzi discordanti all'interno
+    della stessa condizione bloccano la sincronizzazione, anziché inventare
+    un prezzo unico per copie che non lo hanno.
+    """
+    if not os.path.isfile(USATI_DBF_PATH):
+        raise FileNotFoundError(f"DBF usati non trovato: {USATI_DBF_PATH}")
+    discounts = used_discount_settings()
+    by_id: Dict[int, Dict[str, Any]] = {}
+    duplicate_ids = set()
+    for row in testi_rows:
+        rid = get_ci(row, "ID", default=None)
+        if rid is None:
+            continue
+        if int(rid) in by_id:
+            duplicate_ids.add(int(rid))
+        by_id[int(rid)] = row
+    if duplicate_ids:
+        raise ValueError(f"testi.dbf: ID duplicati (es. {sorted(duplicate_ids)[:5]})")
+
+    raw = _read_all_bytes(USATI_DBF_PATH)
+    fields, header_len, record_len, num_records = parse_dbf_fields(raw)
+    needed = {"ID_TESTO", "CONFERMATO", "CANCELLATO", "RESIDUO",
+              "SCONTO_VEN", "PR_VEN_NET", "PR_VEN_LOR"}
+    present = {f[0].upper() for f in fields}
+    if not needed.issubset(present):
+        raise ValueError(f"DBF usati senza campi richiesti: {sorted(needed-present)}")
+    if num_records == 0:
+        raise ValueError("DBF usati vuoto: bloccato per non azzerare scorte per errore")
+    offsets = build_field_offsets(fields)
+    offers: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    stats = {"records": num_records, "eligible_rows": 0, "eligible_units": 0,
+             "excluded_rows": 0, "excluded_units": 0, "other_discount": 0,
+             "orphan_rows": 0, "not_available": 0}
+    for i in range(num_records):
+        row = parse_record(raw, offsets, header_len, record_len, i)
+        if row is None:
+            continue
+        if get_ci(row, "CONFERMATO", default=False) is not True or \
+                get_ci(row, "CANCELLATO", default=False) is True:
+            continue
+        quantity = int(get_ci(row, "RESIDUO", default=0) or 0)
+        if quantity <= 0:
+            stats["not_available"] += 1
+            continue
+        raw_discount = get_ci(row, "SCONTO_VEN", default=None)
+        if raw_discount is None:
+            stats["other_discount"] += 1
+            continue
+        discount = to_decimal(raw_discount, default=Decimal("-1"))
+        if discount == discounts["ESCLUSO"]:
+            stats["excluded_rows"] += 1
+            stats["excluded_units"] += quantity
+            continue
+        if discount == discounts["BUONO"]:
+            key = "BUONO"
+        elif discount == discounts["USURATO"]:
+            key = "USURATO"
+        else:
+            stats["other_discount"] += 1
+            continue
+        rid = get_ci(row, "ID_TESTO", default=None)
+        libro = by_id.get(int(rid)) if rid is not None else None
+        ean = clean_str(get_ci(libro or {}, "CODICE_EAN", default=""))
+        if not libro or not ean:
+            stats["orphan_rows"] += 1
+            logger.warning("Usato ignorato: ID_TESTO=%s senza EAN valido in testi.dbf", rid)
+            continue
+        net = to_decimal(get_ci(row, "PR_VEN_NET", default=None), Decimal("-1"))
+        gross = to_decimal(get_ci(row, "PR_VEN_LOR", default=None), Decimal("-1"))
+        if not (net > 0 and gross > 0 and net <= gross):
+            raise ValueError(f"EAN {ean}, ID_TESTO={rid}: prezzo usato incoerente (netto={net}, lordo={gross})")
+        # Nei DBF reali PR_VEN_NET e' il prezzo netto gia' calcolato dal
+        # gestionale. Se lo sconto viene cambiato a mano ma il netto rimane
+        # vecchio, NON vendere a un prezzo errato senza segnalazione.
+        expected_net = gross * (Decimal("1") - discount / Decimal("100"))
+        if abs(net - expected_net) > Decimal("0.01"):
+            raise ValueError(
+                f"EAN {ean}, ID_TESTO={rid}: SCONTO_VEN={discount}% ma "
+                f"PR_VEN_NET={net} non corrisponde al lordo {gross} "
+                f"(atteso circa {money_str(expected_net)})"
+            )
+        price = money_str(net)
+        compare = money_str(gross) if gross > net else ""
+        by_condition = offers.setdefault(ean, {})
+        offer = by_condition.get(key)
+        if offer is None:
+            offer = {
+                "ean": ean,
+                "condition_key": key,
+                "price": price,
+                "compare_at_price": compare,
+                "quantity": 0,
+            }
+            by_condition[key] = offer
+        elif offer["price"] != price or offer["compare_at_price"] != compare:
+            raise ValueError(
+                f"EAN {ean}, condizione {key}: prezzi differenti tra copie dello stesso libro; "
+                f"esistente {offer['price']}/{offer['compare_at_price']}, "
+                f"nuovo {price}/{compare}. Serve una regola commerciale esplicita."
+            )
+        offer["quantity"] += quantity
+        stats["eligible_rows"] += 1
+        stats["eligible_units"] += quantity
+    for per_ean in offers.values():
+        for offer in per_ean.values():
+            offer["row_hash"] = compute_used_hash(offer)
+    stats["eligible_variants"] = sum(len(per_ean) for per_ean in offers.values())
+    return offers, stats
 
 
 # =============================================================================
@@ -2290,8 +2611,324 @@ def get_migration_args() -> Optional[argparse.Namespace]:
     return parser.parse_args()
 
 
+# =============================================================================
+# USATI: conversione puntuale in opzione "Condizione" e varianti Shopify.
+# Non si usa productSet sui prodotti gia' esistenti (evita cancellazioni).
+# =============================================================================
+
+QUERY_USED_PRODUCT = """
+query UsedProduct($productId: ID!) {
+  product(id: $productId) {
+    id
+    options { name values }
+    variants(first: 20) {
+      nodes {
+        id sku price compareAtPrice inventoryPolicy
+        selectedOptions { name value }
+        inventoryItem { id tracked }
+      }
+      pageInfo { hasNextPage }
+    }
+  }
+}
+""".strip()
+
+MUTATION_USED_OPTIONS_CREATE = """
+mutation UsedOptionsCreate($productId: ID!, $options: [OptionCreateInput!]!) {
+  productOptionsCreate(productId: $productId, options: $options, variantStrategy: LEAVE_AS_IS) {
+    product { id }
+    userErrors { field message code }
+  }
+}
+""".strip()
+
+MUTATION_USED_VARIANTS_CREATE = """
+mutation UsedVariantsCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkCreate(
+    productId: $productId, variants: $variants, strategy: PRESERVE_STANDALONE_VARIANT
+  ) {
+    productVariants {
+      id sku selectedOptions { name value }
+      inventoryPolicy inventoryItem { id tracked }
+    }
+    userErrors { field message }
+  }
+}
+""".strip()
+
+MUTATION_USED_VARIANTS_UPDATE = """
+mutation UsedVariantsUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+    productVariants { id price compareAtPrice inventoryPolicy }
+    userErrors { field message }
+  }
+}
+""".strip()
+
+
+def _used_issue_key(ean: str, condition_key: str) -> str:
+    return f"{ean}#USATO-{condition_key}"
+
+
+def read_used_shopify_product(endpoint: str, product_id: str) -> Dict[str, Any]:
+    response = shopify_graphql(
+        endpoint, SHOPIFY_ACCESS_TOKEN, QUERY_USED_PRODUCT, {"productId": product_id}
+    )
+    product = (response.get("data") or {}).get("product")
+    if not isinstance(product, dict) or product.get("id") != product_id:
+        raise RuntimeError(f"Prodotto Shopify {product_id} non trovato")
+    variants = product.get("variants") or {}
+    if variants.get("pageInfo", {}).get("hasNextPage"):
+        raise RuntimeError(f"Prodotto {product_id}: oltre 20 varianti, bloccata modifica automatica")
+    return product
+
+
+def _product_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return ((product.get("variants") or {}).get("nodes") or [])
+
+
+def _chosen_condition(variant: Dict[str, Any]) -> Optional[str]:
+    for option in variant.get("selectedOptions") or []:
+        if option.get("name") == USATI_OPTION_NAME:
+            return option.get("value")
+    return None
+
+
+def ensure_used_product_option(endpoint: str, product_id: str, ean: str) -> Dict[str, Any]:
+    """Riconverte solo il vecchio Default Title, senza ricreare la variante nuova."""
+    product = read_used_shopify_product(endpoint, product_id)
+    variants = _product_variants(product)
+    original = [v for v in variants if v.get("sku") == ean]
+    if len(original) != 1:
+        raise ValueError(f"EAN {ean}: variante del nuovo non unica nel prodotto Shopify")
+    allowed_skus = {ean, used_sku(ean, "BUONO"), used_sku(ean, "USURATO")}
+    extras = [v.get("sku") for v in variants if v.get("sku") not in allowed_skus]
+    if extras:
+        raise ValueError(f"EAN {ean}: prodotto con varianti estranee {extras}; conversione bloccata")
+    options = product.get("options") or []
+    if len(options) == 1 and options[0].get("name") == USATI_OPTION_NAME:
+        if _chosen_condition(original[0]) != "Nuovo":
+            raise ValueError(f"EAN {ean}: la variante originale non ha Condizione=Nuovo")
+        return product
+    if (len(variants) != 1 or len(options) != 1 or
+            options[0].get("name") != "Title" or
+            (options[0].get("values") or []) != ["Default Title"]):
+        raise ValueError(
+            f"EAN {ean}: opzioni Shopify personalizzate: conversione automatica non sicura"
+        )
+    # La query immediatamente precedente ha verificato SKU, varianti e opzioni.
+    checked_mutation_payload(
+        endpoint, MUTATION_USED_OPTIONS_CREATE,
+        {"productId": product_id,
+         "options": [{"name": USATI_OPTION_NAME, "values": [{"name": "Nuovo"}]}]},
+        "productOptionsCreate",
+    )
+    after = read_used_shopify_product(endpoint, product_id)
+    actual = [v for v in _product_variants(after) if v.get("sku") == ean]
+    if (len(actual) != 1 or actual[0].get("id") != original[0].get("id") or
+            _chosen_condition(actual[0]) != "Nuovo"):
+        raise RuntimeError(f"EAN {ean}: conversione opzione non verificata; STOP")
+    logger.info("EAN %s: prodotto convertito in Condizione senza cambiare variante Nuovo", ean)
+    return after
+
+
+def create_one_used_variant(endpoint: str, product_id: str, offer: Dict[str, Any]) -> Dict[str, Any]:
+    key = offer["condition_key"]
+    sku = used_sku(offer["ean"], key)
+    variant = {
+        "optionValues": [{"optionName": USATI_OPTION_NAME, "name": USATI_CONDITION_NAMES[key]}],
+        "price": offer["price"],
+        "inventoryPolicy": "DENY",
+        "inventoryItem": {"sku": sku, "tracked": True},
+        # productVariantsBulkCreate usa InventoryLevelInput (API 2026-01):
+        # richiede availableQuantity, NON i campi name/quantity del productSet.
+        "inventoryQuantities": [{"locationId": SHOPIFY_LOCATION_ID,
+                                 "availableQuantity": int(offer["quantity"])}],
+    }
+    if offer["compare_at_price"]:
+        variant["compareAtPrice"] = offer["compare_at_price"]
+    checked_mutation_payload(
+        endpoint, MUTATION_USED_VARIANTS_CREATE,
+        {"productId": product_id, "variants": [variant]}, "productVariantsBulkCreate"
+    )
+    # Dopo la creazione NON fidarsi dell'ordine della risposta: verifica SKU esatto.
+    found = find_variant_by_exact_sku(endpoint, sku)
+    if not found or found["product_id"] != product_id or not found.get("tracked"):
+        raise RuntimeError(f"EAN {offer['ean']}: variante usata {sku} non verificata dopo create")
+    product = read_used_shopify_product(endpoint, product_id)
+    match = [v for v in _product_variants(product) if v.get("sku") == sku]
+    if len(match) != 1 or _chosen_condition(match[0]) != USATI_CONDITION_NAMES[key]:
+        raise RuntimeError(f"EAN {offer['ean']}: condizione Shopify non coerente per SKU {sku}")
+    return found
+
+
+def ensure_used_inventory_ready(endpoint: str, found: Dict[str, Any], offer: Dict[str, Any],
+                                run_id: int) -> None:
+    """Le copie usate non devono essere acquistabili con stock negativo."""
+    product_id = found.get("product_id")
+    variant_id = found.get("variant_id")
+    item_id = found.get("inventory_item_id")
+    if not (product_id and variant_id and item_id):
+        raise ValueError("Variante usata: ID Shopify incompleti")
+    if found.get("inventory_policy") != "DENY":
+        checked_mutation_payload(
+            endpoint, MUTATION_USED_VARIANTS_UPDATE,
+            {"productId": product_id, "variants": [{"id": variant_id,
+                                                       "inventoryPolicy": "DENY"}]},
+            "productVariantsBulkUpdate",
+        )
+    if not found.get("tracked"):
+        checked_mutation_payload(
+            endpoint, MUTATION_ITEM_TRACKED,
+            {"id": item_id, "input": {"tracked": True}}, "inventoryItemUpdate"
+        )
+    status = read_variant_inventory_status(endpoint, variant_id)
+    if (status.get("sku") != used_sku(offer["ean"], offer["condition_key"]) or
+            (status.get("product") or {}).get("id") != product_id or
+            (status.get("inventoryItem") or {}).get("id") != item_id):
+        raise ValueError("Variante usata cambiata durante la sincronizzazione: STOP")
+    if ((status.get("inventoryItem") or {}).get("inventoryLevel")) is None:
+        key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"used-activate|{run_id}|{item_id}|{SHOPIFY_LOCATION_ID}"))
+        checked_mutation_payload(
+            endpoint, MUTATION_INVENTORY_ACTIVATE,
+            {"inventoryItemId": item_id, "locationId": SHOPIFY_LOCATION_ID, "key": key},
+            "inventoryActivate",
+        )
+
+
+def sync_used_variants(endpoint: str, state: SyncState, run_id: int,
+                       offers_by_ean: Dict[str, Dict[str, Dict[str, Any]]],
+                       stats: Dict[str, int]) -> None:
+    """Esegue il delta delle varianti usate: creazione/stock/prezzo e azzeramento."""
+    previous = state.load_used()
+    current: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for ean, by_condition in offers_by_ean.items():
+        for key, offer in by_condition.items():
+            current[(ean, key)] = offer
+    # Una condizione che scompare, anche per cambio config, va azzerata:
+    # diversamente Shopify manterrebbe in vendita le ultime copie usate.
+    for k, old in previous.items():
+        if k not in current:
+            current[k] = used_offer_for_zero(k[0], k[1], old)
+
+    pending = []
+    for (ean, key), offer in sorted(current.items()):
+        prev = previous.get((ean, key))
+        if prev and prev["row_hash"] == offer["row_hash"] and all(
+            prev.get(field) for field in ("product_id", "variant_id", "inventory_item_id")
+        ):
+            stats["used_unchanged"] += 1
+            continue
+        pending.append(offer)
+    logger.info("USATI: varianti da sincronizzare=%d, invariati=%d", len(pending),
+                stats["used_unchanged"])
+    created_count = 0
+    items_current = state.load_all()
+    # Verifica anti-conflitto degli ID locali (nuovi/usati).
+    inventory_owned = {
+        v.get("inventory_item_id"): f"{ean}/NUOVO"
+        for ean, v in items_current.items() if v.get("inventory_item_id")
+    }
+    for (ean, key), v in previous.items():
+        iid = v.get("inventory_item_id")
+        if iid and iid in inventory_owned:
+            raise RuntimeError(f"InventoryItem condiviso fra SKU diversi: {iid}")
+        if iid:
+            inventory_owned[iid] = f"{ean}/{key}"
+
+    for offer in pending:
+        ean, kind, qty = offer["ean"], offer["condition_key"], offer["quantity"]
+        issue_key = _used_issue_key(ean, kind)
+        if not state.issue_due(issue_key):
+            stats["deferred"] += 1
+            continue
+        old = previous.get((ean, kind))
+        try:
+            sku = used_sku(ean, kind)
+            new_product = items_current.get(ean)
+            # All'azzeramento puo' servire una variante rimasta in Shopify
+            # anche quando il libro e' stato cancellato dai testi.
+            product_id = ((new_product or {}).get("product_id") or
+                          (old or {}).get("product_id"))
+            if not product_id:
+                raise LookupError(f"EAN {ean}: prodotto nuovo privo di product_id nello stato")
+            found = find_variant_by_exact_sku(endpoint, sku)
+            if found and found.get("product_id") != product_id:
+                raise ValueError(f"SKU {sku} trovato sotto un ALTRO prodotto Shopify: STOP")
+            created = False
+            if found is None:
+                if qty == 0:
+                    # La variante e' stata rimossa da Shopify: non serve ricrearla
+                    # soltanto per scriverle stock zero. Manteniamo il problema visibile.
+                    raise LookupError(f"SKU {sku} assente da Shopify, stato SQLite da riconciliare")
+                if created_count >= max(0, USATI_MAX_VARIANTS_PER_RUN):
+                    stats["deferred"] += 1
+                    logger.warning("EAN %s: limite USATI_MAX_VARIANTS_PER_RUN, rinvio al ciclo successivo", ean)
+                    continue
+                # Se la mutation precedente e' riuscita ma SQLite non e' stato
+                # aggiornato, il controllo SKU evita di creare un duplicato.
+                ensure_used_product_option(endpoint, product_id, ean)
+                found = find_variant_by_exact_sku(endpoint, sku)
+                if found is None:
+                    found = create_one_used_variant(endpoint, product_id, offer)
+                    created_count += 1
+                    created = True
+            if found.get("product_id") != product_id:
+                raise ValueError(f"SKU {sku}: prodotto non coerente")
+            expected_owner = f"{ean}/{kind}"
+            owner = inventory_owned.get(found.get("inventory_item_id"))
+            if owner and owner != expected_owner:
+                raise ValueError(f"InventoryItem duplicato: {found['inventory_item_id']} appartiene a {owner}")
+            inventory_owned[found["inventory_item_id"]] = expected_owner
+            product = read_used_shopify_product(endpoint, product_id)
+            variants = [v for v in _product_variants(product) if v.get("sku") == sku]
+            if len(variants) != 1 or _chosen_condition(variants[0]) != USATI_CONDITION_NAMES[kind]:
+                raise ValueError(f"SKU {sku}: opzione Condizione non coerente")
+            ensure_used_inventory_ready(endpoint, found, offer, run_id)
+            # Prezzi: aggiorna soltanto varianti usate, non tocca il prezzo del Nuovo.
+            v = variants[0]
+            current_price = money_str(to_decimal(v.get("price")))
+            current_compare = (money_str(to_decimal(v["compareAtPrice"]))
+                               if v.get("compareAtPrice") is not None else "")
+            if current_price != offer["price"] or current_compare != offer["compare_at_price"]:
+                payload = checked_mutation_payload(
+                    endpoint, MUTATION_USED_VARIANTS_UPDATE,
+                    {"productId": product_id, "variants": [{
+                        "id": found["variant_id"], "price": offer["price"],
+                        "compareAtPrice": offer["compare_at_price"] or None,
+                        "inventoryPolicy": "DENY",
+                    }]}, "productVariantsBulkUpdate"
+                )
+                updated = payload.get("productVariants") or []
+                if not any(u.get("id") == found["variant_id"] for u in updated):
+                    raise RuntimeError(f"SKU {sku}: update prezzo non confermato")
+            # Anche qty=0 viene scritto come valore assoluto, poi si salva l'hash.
+            result = inventory_set_available_batch(
+                endpoint, [(found["inventory_item_id"], qty)],
+                reference_document_uri=f"gid://erp-connector/UsedSync/run-{run_id}-{kind}",
+            )
+            errors = inventory_errors(result)
+            if errors:
+                raise RuntimeError(f"SKU {sku}: stock NON aggiornato: {errors}")
+            state.upsert_used(run_id, offer, product_id, found["variant_id"],
+                              found["inventory_item_id"])
+            state.clear_issue(issue_key)
+            if created:
+                stats["used_created"] += 1
+            elif qty == 0:
+                stats["used_zeroed"] += 1
+            else:
+                stats["used_updated"] += 1
+            logger.info("USATI OK EAN=%s | condizione=%s | qty=%s | prezzo=%s",
+                        ean, kind, qty, offer["price"])
+        except Exception as exc:
+            stats["failed"] += 1
+            state.record_issue(issue_key, str(exc))
+            logger.exception("USATI ERRORE EAN=%s condizione=%s: %s", ean, kind, exc)
+
+
 def main() -> None:
-    logger.info("=== AVVIO SYNC SHOPIFY - V3 (SCOLASTICO MONITORATO + CONTINUE) ===")
+    logger.info("=== AVVIO SYNC SHOPIFY - V5 (CORREZIONE VARIANTI USATE) ===")
     logger.info(f"APP_DIR: {SCRIPT_DIR} | config: {ENV_PATH}")
     logger.info(f"State DB: {STATE_DB_PATH} | log: {LOG_PATH}")
     logger.info("WordPress cover: %s | azzera EAN scomparsi: %s | DRY_RUN: %s",
@@ -2304,9 +2941,20 @@ def main() -> None:
         logger.warning("EAN duplicati nel DBF: %s; prevale l'ultima occorrenza",
                        len(records) - len(current_rows))
 
+    if USATI_SYNC_ENABLED:
+        if LIMIT_RECORDS and not DRY_RUN:
+            raise RuntimeError("USATI_SYNC_ENABLED=1 richiede LIMIT_RECORDS=0 per evitare azzeramenti parziali")
+        used_offers, used_summary = read_used_offers(records)
+        logger.info("USATI: file=%s | sconti=%s | riepilogo=%s", USATI_DBF_PATH,
+                    used_discount_settings(), used_summary)
+    else:
+        used_offers, used_summary = {}, {}
+        logger.info("USATI_SYNC_ENABLED=0: sincronizzazione usati disattivata")
+
     state = SyncState(STATE_DB_PATH, read_only=DRY_RUN)
     try:
         prev = state.load_all()
+        prev_used = state.load_used() if USATI_SYNC_ENABLED else {}
         dup = shared_inventory_ids(prev)
         for inv_id, eans in dup.items():
             logger.warning("ID inventario DUPLICATO nello stato: %s -> %s", inv_id, eans)
@@ -2338,6 +2986,19 @@ def main() -> None:
                     len(unchanged_rows), len(missing))
 
         if DRY_RUN:
+            if USATI_SYNC_ENABLED:
+                target = {(ean, key): offer for ean, kinds in used_offers.items()
+                          for key, offer in kinds.items()}
+                used_deltas = sum(
+                    key not in prev_used or prev_used[key]["row_hash"] != offer["row_hash"]
+                    for key, offer in target.items()
+                )
+                zero_pending = sum(key not in target and old["quantity"] != 0
+                                   for key, old in prev_used.items())
+                logger.info("CHECK USATI: varianti vendibili=%s | da creare/aggiornare (stima)=%s | "
+                            "da azzerare=%s | esclusi per sconto=%s unità",
+                            len(target), used_deltas, zero_pending,
+                            used_summary.get("excluded_units", 0))
             logger.info("CHECK SOLA LETTURA: non contatto Shopify, non modifico SQLite.")
             for item in changed[:25]:
                 logger.info("DA AGGIORNARE: EAN=%s qta=%s item=%s", item["ean"],
@@ -2360,7 +3021,9 @@ def main() -> None:
         run_id = state.start_run()
         stats = {"created": 0, "updated": 0, "repaired": 0,
                  "unchanged": len(unchanged_rows), "zeroed": 0,
-                 "failed": 0, "deferred": 0, "skipped_zero": 0}
+                 "failed": 0, "deferred": 0, "skipped_zero": 0,
+                 "used_created": 0, "used_updated": 0,
+                 "used_unchanged": 0, "used_zeroed": 0}
         try:
             # Lo stato degli invariati puo' avanzare; quelli falliti non vengono
             # mai contrassegnati come sincronizzati.
@@ -2417,7 +3080,8 @@ def main() -> None:
                             "key": EXTERNAL_ID_KEY, "value": ean
                         }},
                         "input": build_productset_input_from_testi_row(
-                            item["row"], include_files=True, wordpress_cover_by_ean=covers
+                            item["row"], include_files=True, wordpress_cover_by_ean=covers,
+                            used_offers=used_offers.get(ean) if USATI_SYNC_ENABLED else None,
                         )
                     }, ensure_ascii=False, separators=(",", ":")))
                 staged = staged_upload_jsonl(
@@ -2458,6 +3122,11 @@ def main() -> None:
                         stats["failed"] += 1
                         continue
                     state.upsert_items_many([(run_id, ean, item["row_hash"], pid, vid, iid)])
+                    if USATI_SYNC_ENABLED and used_offers.get(ean):
+                        # Anche se productSet include le varianti usate, non
+                        # considerarle sincronizzate finche' la fase USATI
+                        # non avra' verificato SKU, tracking, prezzo e scorte.
+                        stats["used_created"] += len(used_offers[ean])
                     state.clear_issue(ean)
                     stats["created"] += 1
                     if PUBLICATION_IDS:
@@ -2542,6 +3211,14 @@ def main() -> None:
                 t = time.perf_counter()
                 inventory_batch_update_resilient(endpoint, state, run_id, part, stats)
                 logger.info("[inventory] Batch %d completato in %.2fs", ix, time.perf_counter() - t)
+
+            # La sincronizzazione del nuovo termina prima di quella degli usati:
+            # gli EAN creati in questo run hanno ormai il product_id disponibile.
+            if USATI_SYNC_ENABLED:
+                unlocked = state.unlock_v4_used_schema_errors_once()
+                if unlocked:
+                    logger.info("USATI V5: sbloccati %d tentativi V4 con vecchio input GraphQL", unlocked)
+                sync_used_variants(endpoint, state, run_id, used_offers, stats)
 
             # Pulisce i vecchi link duplicati per EAN scomparsi SOLO dopo
             # aver dimostrato che quell'InventoryItem appartiene allo SKU attivo.
